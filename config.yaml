@@ -1,0 +1,62 @@
+# =========================
+# PPO (exactly as requested)
+# =========================
+policy: MlpPolicy
+total_timesteps: 10000
+learning_rate: 5.0e-6
+n_steps: 2048              # used by your validation mini-runs; main train sets rollout from rebalance_interval
+batch_size: 512
+n_epochs: 5
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.075
+clip_range_vf: 0.075
+ent_coef: 0.0003
+vf_coef: 0.5
+max_grad_norm: 0.3
+target_kl: 0.125
+net_arch: [256, 256]
+ortho_init: true
+activation: tanh
+
+# =========================
+# Environment configuration
+# =========================
+# Keep reward = excess (no alpha in reward), with structural penalties.
+rebalance_interval: 5          # business days between rebalances
+max_weight: 0.10               # per-asset cap
+allow_cash: true               # synthetic cash asset accrues rf
+transaction_cost_bps: 20.0      # per unit turnover cost
+normalize_features: true       # z-normalize lagged features inside env
+obs_clip: 7.5                  # clamp observation vector inside env
+on_inactive: to_cash           # forced sells go to cash until next rebalance
+
+# Reward mix (defaults replicate current behavior)
+weight_excess: 0.0    # credit for r_p - r_f
+weight_alpha:  1.0    # credit for r_p - r_index
+
+# Reward penalties (initial guesses; will be tuned by the grid below)
+lambda_turnover: 0.0002
+lambda_hhi: 0.01
+lambda_drawdown: 0.005
+
+# Tail risk penalty (optional but recommended for credit)
+lambda_tail: 0.50              # strength of ES penalty
+tail_window: 252               # lookback for tail estimation (1Y)
+tail_q: 0.05                   # ES at 5% left tail
+dd_mode: level                 # drawdown penalty uses level (not increment)
+
+# =========================
+# Validation / model selection
+# =========================
+# Grid used by validate_reward_params() to pick penalties in-sample.
+lambda_grid:
+  lambda_turnover: [0.0001, 0.0002, 0.0004]
+  lambda_hhi:      [0.005, 0.01, 0.02]
+  lambda_drawdown: [0.0025, 0.005, 0.01]
+
+# Choose which metric the grid maximizes; IR = mean(r - idx)/TE (annualized).
+selection_metric: ir
+
+n_steps: 51200
+batch_size: 5120
