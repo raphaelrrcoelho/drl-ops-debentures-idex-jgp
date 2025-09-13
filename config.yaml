@@ -1,11 +1,11 @@
 # =========================
 # PPO (exactly as requested)
 # =========================
-policy: MlpPolicy
+policy: MultiInputPolicy
 total_timesteps: 10000
 learning_rate: 5.0e-6
-n_steps: 2048              # used by your validation mini-runs; main train sets rollout from rebalance_interval
-batch_size: 512
+n_steps: 12288              # used by your validation mini-runs; main train sets rollout from rebalance_interval
+batch_size: 4096
 n_epochs: 5
 gamma: 0.99
 gae_lambda: 0.95
@@ -27,6 +27,7 @@ rebalance_interval: 5          # business days between rebalances
 max_weight: 0.10               # per-asset cap
 allow_cash: true               # synthetic cash asset accrues rf
 transaction_cost_bps: 20.0      # per unit turnover cost
+delist_extra_bps: 20.0         # extra slippage on forced sells
 normalize_features: true       # z-normalize lagged features inside env
 obs_clip: 7.5                  # clamp observation vector inside env
 on_inactive: to_cash           # forced sells go to cash until next rebalance
@@ -58,5 +59,5 @@ lambda_grid:
 # Choose which metric the grid maximizes; IR = mean(r - idx)/TE (annualized).
 selection_metric: ir
 
-n_steps: 51200
-batch_size: 5120
+n_steps: 12288 # 4096 * 8
+batch_size: 4096 #

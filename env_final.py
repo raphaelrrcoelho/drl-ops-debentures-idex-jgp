@@ -48,8 +48,8 @@ class EnvConfig:
     # Costs & penalties
     weight_excess: float = 0.0   # keep default = 0.0
     weight_alpha:  float = 1.0   # keep default = 1.0 (pure alpha, matches your current behavior)
-    transaction_cost_bps: float = 5.0           # linear cost per unit turnover
-    delist_extra_bps: float = 10.0              # extra slippage on forced sells
+    transaction_cost_bps: float = 20.0           # linear cost per unit turnover
+    delist_extra_bps: float = 20.0              # extra slippage on forced sells
     lambda_turnover: float = 0.0002             # turnover penalty weight
     lambda_hhi: float = 0.01                    # concentration penalty weight
     lambda_drawdown: float = 0.005              # drawdown penalty weight
@@ -188,7 +188,10 @@ class DebentureTradingEnv(gym.Env):
         n_assets = self.n_assets
         self.action_space = spaces.Box(low=0.0, high=1.0, shape=(n_assets,), dtype=np.float32)
         obs_dim = self._obs_size()
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.observation_space = spaces.Dict({
+            'observation': spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
+            'action_mask': spaces.Box(0, 1, shape=(self.n_assets,), dtype=np.int8)
+        })
 
         # State
         self.t: int = 0
@@ -398,6 +401,9 @@ class DebentureTradingEnv(gym.Env):
 
     def _get_observation(self) -> np.ndarray:
         t = min(self.t, self.T - 1)
+        if t >= self.ACT.shape[0]:
+            print(f"[WARN] t={t} exceeds ACT.shape[0]={self.ACT.shape[0]}, clamping to last available")
+            t = self.ACT.shape[0] - 1
         parts: List[np.ndarray] = []
         if self.F > 0:
             X_t = self.X[t].copy()  # [N,F]
@@ -417,7 +423,12 @@ class DebentureTradingEnv(gym.Env):
         obs = np.concatenate(parts) if parts else np.zeros((self._obs_size(),), dtype=np.float32)
         clip = float(self.cfg.obs_clip) if self.cfg.obs_clip is not None else 10.0
         obs = np.nan_to_num(obs, nan=0.0, posinf=clip, neginf=-clip)
-        return np.clip(obs, -clip, clip).astype(np.float32)
+        mask = self.ACT[self.t].astype(np.int8)
+        
+        return {
+            'observation': np.clip(obs, -clip, clip).astype(np.float32),
+            'action_mask': mask
+        } 
 
     # ------------------------------- Gym API -------------------------------- #
 
@@ -442,16 +453,17 @@ class DebentureTradingEnv(gym.Env):
         self.curr_w[mask0] = 0.0  # start from cash; per your rules cash accrues rf if enabled
         self.wealth = 1.0
         # ... remainder unchanged (build obs with self.t, etc.) ...
-        obs = self._get_observation()
         info = {"date": pd.Timestamp(self.dates[self.t]).to_pydatetime()}
-        return obs, info
+        return self._get_observation(), info
 
     def step(self, action: np.ndarray):
         # Time index guard
         t = int(self.t)
         terminated = False
         truncated = False
-        if t >= self.T:
+        if t >= self.T or t >= self.ACT.shape[0]:
+            # Not enough data, terminate episode
+            print(f"[WARN] Episode terminated early: t={t}, T={self.T}, ACT.shape={self.ACT.shape}")
             return self._get_observation(), 0.0, True, False, {}
 
         # Day's arrays

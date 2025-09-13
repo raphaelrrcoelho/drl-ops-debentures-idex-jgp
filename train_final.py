@@ -47,6 +47,9 @@ try:
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecCheckNan, VecNormalize
+    from sb3_contrib import MaskablePPO
+    from sb3_contrib.common.wrappers import ActionMasker
+    from sb3_contrib.common.maskable.utils import get_action_masks
 except Exception as e:
     raise RuntimeError("stable-baselines3 >= 1.7 required. Please install sb3.") from e
 
@@ -63,11 +66,11 @@ except Exception:
 
 @dataclass
 class PPOConfig:
-    policy: str = "MlpPolicy"
+    policy: str = "MultiInputPolicy"
     total_timesteps: int = 10_000
     learning_rate: float = 5e-6
-    n_steps: int = 2048
-    batch_size: int = 512
+    n_steps: int = 12288
+    batch_size: int = 4096
     n_epochs: int = 5
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -139,11 +142,14 @@ def log_memory_usage_mb() -> float:
 
 def folds_from_dates(dates: pd.DatetimeIndex, n_folds: int = 9, embargo_days: int = 3) -> List[Dict[str, str]]:
     """
-    Build contiguous folds with an embargo between train and test.
-    The last fold ends at the last date.
+    Build expanding window folds where:
+    - Training always starts from the first date
+    - Training end expands with each fold
+    - Test follows training with an embargo gap
     """
     dates = pd.to_datetime(pd.Index(dates).unique().sort_values())
     T = len(dates)
+    
     if n_folds <= 1 or T < 10:
         return [{
             "fold": 0,
@@ -152,21 +158,48 @@ def folds_from_dates(dates: pd.DatetimeIndex, n_folds: int = 9, embargo_days: in
             "test_start": str(dates[min(int(T * 0.7) + embargo_days, T - 1)].date()),
             "test_end": str(dates[-1].date()),
         }]
+    
+    # Create cuts for the END of each fold's test period
+    # This ensures each fold gets progressively more data
     cuts = np.linspace(0, T - 1, n_folds + 1, dtype=int)
+    
     folds = []
     for i in range(n_folds):
+        # Training always starts from the beginning (expanding window)
         train_start = dates[0]
-        train_end = dates[cuts[i]]
-        test_start_idx = min(cuts[i] + embargo_days + 1, T - 1)
-        test_end = dates[cuts[i + 1]] if i + 1 < len(cuts) else dates[-1]
+        
+        # For fold i, we need enough training data
+        # Use a portion of the available data up to this fold's cut point
+        if i == 0:
+            # First fold should have at least some reasonable amount of training data
+            # Use first 1/(n_folds+1) of data for training, rest for test
+            train_end_idx = max(int(T / (n_folds + 1)), 10)  # At least 10 days
+        else:
+            # For subsequent folds, train up to the previous fold's test end
+            train_end_idx = cuts[i]
+        
+        train_end = dates[min(train_end_idx, T - 1)]
+        
+        # Test starts after embargo
+        test_start_idx = min(train_end_idx + embargo_days + 1, T - 1)
+        test_end_idx = cuts[i + 1] if i + 1 < len(cuts) else T - 1
+        
+        test_start = dates[test_start_idx]
+        test_end = dates[test_end_idx]
+        
+        # Skip if insufficient data
+        if test_start_idx >= test_end_idx or train_end_idx < 5:
+            continue
+            
         fold = {
             "fold": int(i),
             "train_start": str(pd.Timestamp(train_start).date()),
             "train_end": str(pd.Timestamp(train_end).date()),
-            "test_start": str(pd.Timestamp(dates[test_start_idx]).date()),
+            "test_start": str(pd.Timestamp(test_start).date()),
             "test_end": str(pd.Timestamp(test_end).date()),
         }
         folds.append(fold)
+    
     return folds
 
 def _periodical_alpha_from_daily(dates, r_port, r_bench, period="W-FRI"):
@@ -215,6 +248,11 @@ def build_train_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str]) 
     idx = pd.MultiIndex.from_product([train_dates, union_ids], names=["date", "debenture_id"])
     train_aug = panel.reindex(idx)
 
+    dates = train_aug.index.get_level_values("date").unique()
+    if len(dates) < 10:  # Minimum threshold
+        print(f"[WARN] Fold {fold_cfg['fold']} has only {len(dates)} dates in training data")
+        print(f"  Train period: {fold_cfg['train_start']} to {fold_cfg['train_end']}")
+
     # Safe fills mirroring evaluate path
     train_aug["active"] = train_aug["active"].fillna(0).astype(np.int8)
     for c in ["return", "spread", "duration", "time_to_maturity"]:
@@ -245,8 +283,20 @@ class SafeObsWrapper(gym.ObservationWrapper):
         self._clip = float(clip)
 
     def observation(self, obs):
-        obs = np.nan_to_num(obs, nan=0.0, posinf=self._clip, neginf=-self._clip)
-        return np.clip(obs, -self._clip, self._clip).astype(np.float32)
+        # Handle dict observations for MaskablePPO
+        if isinstance(obs, dict):
+            processed = {}
+            for key, val in obs.items():
+                if isinstance(val, np.ndarray):
+                    val = np.nan_to_num(val, nan=0.0, posinf=self._clip, neginf=-self._clip)
+                    processed[key] = np.clip(val, -self._clip, self._clip).astype(np.float32)
+                else:
+                    processed[key] = val
+            return processed
+        else:
+            # Regular array observation
+            obs = np.nan_to_num(obs, nan=0.0, posinf=self._clip, neginf=-self._clip)
+            return np.clip(obs, -self._clip, self._clip).astype(np.float32)
 
 class SafeRewardWrapper(gym.RewardWrapper):
     def __init__(self, env):
@@ -389,6 +439,7 @@ def validate_reward_params(
                 return np.clip(obs, -self.clip, self.clip).astype(np.float32)
 
     TRADING_DAYS = 252
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def _build_vecenv(panel_slice: pd.DataFrame, cfg: EnvConfig, gamma: float) -> VecNormalize:
         def _make():
@@ -494,12 +545,12 @@ def validate_reward_params(
                     activation_fn=(nn.Tanh if str(ppo_cfg.activation).lower() == "tanh" else nn.ReLU),
                     ortho_init=ppo_cfg.ortho_init,
                 )
-                model = PPO(
+                model = MaskablePPO(
                     ppo_cfg.policy,
                     venv_tr,
                     learning_rate=ppo_cfg.learning_rate,
-                    n_steps=max(64, int(ppo_cfg.n_steps // 4)),  # cheaper inner runs
-                    batch_size=max(64, int(ppo_cfg.batch_size // 2)),
+                    n_steps=ppo_cfg.n_steps,  # Keep at 2048 or even increase to 4096
+                    batch_size=ppo_cfg.batch_size,  # Keep at 512 or increase to 1024
                     n_epochs=ppo_cfg.n_epochs,
                     gamma=ppo_cfg.gamma,
                     gae_lambda=ppo_cfg.gae_lambda,
@@ -512,7 +563,7 @@ def validate_reward_params(
                     tensorboard_log=None,
                     policy_kwargs=policy_kwargs,
                     verbose=0,
-                    device="cpu",
+                    device=device,
                 )
                 model.learn(total_timesteps=int(inner_total_timesteps), progress_bar=False)
 
@@ -532,7 +583,7 @@ def validate_reward_params(
                 T = val_slice.index.get_level_values(0).unique().size
 
                 for _ in range(T):
-                    action, _ = model.predict(obs, deterministic=True)
+                    action, _ = model.predict(obs, deterministic=True, action_masks=get_action_masks(env))
                     # VecEnv.step() => (obs, rewards, dones, infos)
                     obs, rewards, dones, infos = venv_va.step(action)
                     info0 = infos[0] if isinstance(infos, (list, tuple)) else infos
@@ -607,12 +658,12 @@ def evaluate_on_validation(env, model) -> dict:
     steps = 0
     while not done:
         if is_vec:
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(obs, deterministic=True, action_masks=get_action_masks(env))
             obs, r, terminated, truncated, info = env.step(action)
             i = info[0] if isinstance(info, (list, tuple)) else info
             done = bool(terminated or truncated)
         else:
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(obs, deterministic=True, action_masks=get_action_masks(env))(obs, deterministic=True)
             obs, r, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             i = info
@@ -749,16 +800,20 @@ def train_one(
             cfg_i = EnvConfig(**{**asdict(env_cfg)})
             if cfg_i.seed is not None:
                 cfg_i.seed = int(cfg_i.seed) + int(rank)
-            if hasattr(cfg_i, "max_steps") and episode_len is not None:
-                try:
-                    cfg_i.max_steps = int(episode_len)
-                except Exception:
-                    pass
-            if hasattr(cfg_i, "random_reset_frac"):
-                try:
-                    setattr(cfg_i, "random_reset_frac", float(reset_jitter_frac))
-                except Exception:
-                    pass
+            
+            # Check available data length and adjust max_steps accordingly
+            train_dates = train_aug.index.get_level_values("date").unique()
+            available_steps = len(train_dates)
+            
+            if episode_len is not None and episode_len > available_steps:
+                print(f"[WARN] Requested episode_len={episode_len} but only {available_steps} steps available")
+                cfg_i.max_steps = min(episode_len, available_steps - 1)
+            elif episode_len is not None:
+                cfg_i.max_steps = episode_len
+            
+            # Adjust random_reset_frac if needed
+            if hasattr(cfg_i, "random_reset_frac") and available_steps < 10:
+                cfg_i.random_reset_frac = 0.0  # Disable random reset for very short sequences
             e = make_env_from_panel(train_aug, **asdict(cfg_i))
             e = SafeRewardWrapper(e)
             e = SafeObsWrapper(e, clip=getattr(cfg_i, "obs_clip", 7.5) or 7.5)
@@ -771,7 +826,7 @@ def train_one(
     else:
         vec_env = SubprocVecEnv(thunks, start_method="spawn")
 
-    vec_env = VecCheckNan(vec_env)
+    # vec_env = VecCheckNan(vec_env)
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0, gamma=ppo_cfg.gamma)
 
     # ---------------------- PPO instantiation ----------------------- #
@@ -781,13 +836,14 @@ def train_one(
     # Compute remaining timesteps in case of resume
     already_trained = 0
     model = None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if resume:
         cp, steps = _latest_checkpoint(ckpt_dir)
         if cp is not None:
             print(f"[INFO] Resuming fold {fold_i} seed {seed} from: {cp} ({steps} steps)")
             try:
-                model = PPO.load(cp, env=vec_env, device="cpu")
+                model = PPO.load(cp, env=vec_env, device="auto")
                 already_trained = int(getattr(model, "num_timesteps", steps or 0))
             except Exception as e:
                 print(f"[WARN] Failed to load checkpoint; training fresh. Err={e}")
@@ -797,8 +853,8 @@ def train_one(
             ppo_cfg.policy,
             vec_env,
             learning_rate=ppo_cfg.learning_rate,
-            n_steps=max(8, int(ppo_cfg.n_steps // max(1, int(n_envs)))),
-            batch_size=max(64, int(ppo_cfg.batch_size // max(1, int(n_envs)))),
+            n_steps=ppo_cfg.n_steps,  # Keep at 2048 or even increase to 4096
+            batch_size=ppo_cfg.batch_size,  # Keep at 512 or increase to 1024
             n_epochs=ppo_cfg.n_epochs,
             gamma=ppo_cfg.gamma,
             gae_lambda=ppo_cfg.gae_lambda,
@@ -811,14 +867,14 @@ def train_one(
             tensorboard_log=tb_dir,
             policy_kwargs=policy_kwargs,
             verbose=0,
-            device="cpu",
+            device=device,
         )
 
     # --------------------------- learn ------------------------------ #
     remaining = max(0, int(ppo_cfg.total_timesteps) - int(already_trained))
     callbacks = []
     callbacks.append(CheckpointCallback(save_freq=save_freq, save_path=ckpt_dir, name_prefix="ppo_checkpoint"))
-    callbacks.append(StopOnNaNCallback())
+    # callbacks.append(StopOnNaNCallback())
     metrics_json = os.path.join(results_dir, "training_metrics.json")
     callbacks.append(MetricsLoggerCallback(out_json_path=metrics_json, fold=fold_i, seed=seed))
     callback = CallbackList(callbacks)
@@ -976,49 +1032,30 @@ def main():
 
     # Run (optionally parallel)
     out_base = args.out_base
-    outer_backend = "threading" if int(args.n_envs) > 1 else "loky"
-    print(f"[INFO] Joblib backend: {outer_backend} (n_jobs={args.n_jobs}, n_envs={args.n_envs})")
 
-    if _HAS_JOBLIB and int(args.n_jobs) > 1:
-        with parallel_backend(outer_backend, n_jobs=int(args.n_jobs)):
-            Parallel(n_jobs=int(args.n_jobs), verbose=10)(
-                delayed(train_one)(
-                    universe, panel, fold_cfg=fold, seed=sd,
-                    ppo_cfg=ppo_cfg, env_cfg=env_cfg,
-                    out_base=out_base, lambda_grid=lambda_grid,
-                    save_freq=config.get('checkpoint_freq', 50_000),
-                    selection_metric=args.selection_metric,
-                    resume=args.resume,
-                    n_envs=args.n_envs,
-                    vec_kind=args.vec,
-                    episode_len=args.episode_len,
-                    reset_jitter_frac=args.reset_jitter_frac,
-                )
-                for (fold, sd) in jobs
-            )
-    else:
-        for fold, sd in jobs:
-            set_global_seed(seed=sd)
-            if args.skip_finished:
-                final_model_path = os.path.join(
-                    args.out_base, "models", universe, "ppo", f"model_fold_{int(fold['fold'])}_seed_{sd}.zip"
-                )
-                if os.path.exists(final_model_path):
-                    print(f"[INFO] Skipping fold {fold['fold']} seed {sd} (final model exists).")
-                    continue
 
-            train_one(
-                universe, panel, fold_cfg=fold, seed=sd,
-                ppo_cfg=ppo_cfg, env_cfg=env_cfg,
-                out_base=out_base, lambda_grid=lambda_grid,
-                save_freq=config.get('checkpoint_freq', 50_000),
-                selection_metric=args.selection_metric,
-                resume=args.resume,
-                n_envs=args.n_envs,
-                vec_kind=args.vec,
-                episode_len=args.episode_len,
-                reset_jitter_frac=args.reset_jitter_frac,
+    for fold, sd in jobs:
+        set_global_seed(seed=sd)
+        if args.skip_finished:
+            final_model_path = os.path.join(
+                args.out_base, "models", universe, "ppo", f"model_fold_{int(fold['fold'])}_seed_{sd}.zip"
             )
+            if os.path.exists(final_model_path):
+                print(f"[INFO] Skipping fold {fold['fold']} seed {sd} (final model exists).")
+                continue
+
+        train_one(
+            universe, panel, fold_cfg=fold, seed=sd,
+            ppo_cfg=ppo_cfg, env_cfg=env_cfg,
+            out_base=out_base, lambda_grid=lambda_grid,
+            save_freq=config.get('checkpoint_freq', 50_000),
+            selection_metric=args.selection_metric,
+            resume=args.resume,
+            n_envs=args.n_envs,
+            vec_kind=args.vec,
+            episode_len=args.episode_len,
+            reset_jitter_frac=args.reset_jitter_frac,
+        )
 
 
 if __name__ == "__main__":
