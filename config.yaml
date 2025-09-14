@@ -6,8 +6,10 @@
 policy: MultiInputPolicy
 total_timesteps: 10000
 learning_rate: 5.0e-6
-n_steps: 12288
-batch_size: 4096
+n_steps: 256  # Smaller, more frequent updates
+batch_size: 64  # Faster gradient computations  
+n_envs: 16  # More parallel environments (if memory allows)
+gradient_accumulation_steps: 4  # Simulate larger batches
 n_epochs: 5
 gamma: 0.99
 gae_lambda: 0.95
@@ -68,7 +70,7 @@ random_reset_frac: 0.0  # For training data augmentation
 # ========================
 
 # In-sample parameter validation
-do_validation: true  # Set to false to skip validation
+do_validation: false  # Set to false to skip validation
 validation_timesteps: 1000  # Timesteps for inner validation loop
 validation_split: 0.8  # Train/val split for parameter selection
 selection_metric: ir  # Metric to optimize: "ir", "sharpe", "sortino", "calmar"
@@ -94,13 +96,13 @@ tensorboard_log: true
 verbose: 0  # 0=silent, 1=info, 2=debug
 
 # Parallel training
-n_envs: 8  # Number of parallel environments per training
+#n_envs: 8  # Number of parallel environments per training
 n_jobs: 1  # Number of parallel fold/seed combinations
 
 # Training options
 skip_finished: true
 resume_from_checkpoint: true
-episode_len: null  # Set to integer to truncate episodes
+episode_len: 256  # Set to integer to truncate episodes
 reset_jitter_frac: 0.9  # Randomize starting point in training data
 
 # ========================
