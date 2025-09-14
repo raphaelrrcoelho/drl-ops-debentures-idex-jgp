@@ -1,10 +1,12 @@
-# =========================
-# PPO (exactly as requested)
-# =========================
+# ========================
+# Training Configuration
+# ========================
+
+# PPO Hyperparameters
 policy: MultiInputPolicy
 total_timesteps: 10000
 learning_rate: 5.0e-6
-n_steps: 12288              # used by your validation mini-runs; main train sets rollout from rebalance_interval
+n_steps: 12288
 batch_size: 4096
 n_epochs: 5
 gamma: 0.99
@@ -19,45 +21,122 @@ net_arch: [256, 256]
 ortho_init: true
 activation: tanh
 
-# =========================
-# Environment configuration
-# =========================
-# Keep reward = excess (no alpha in reward), with structural penalties.
-rebalance_interval: 5          # business days between rebalances
-max_weight: 0.10               # per-asset cap
-allow_cash: true               # synthetic cash asset accrues rf
-transaction_cost_bps: 20.0      # per unit turnover cost
-delist_extra_bps: 20.0         # extra slippage on forced sells
-normalize_features: true       # z-normalize lagged features inside env
-obs_clip: 7.5                  # clamp observation vector inside env
-on_inactive: to_cash           # forced sells go to cash until next rebalance
+# ========================
+# Environment Configuration
+# ========================
 
-# Reward mix (defaults replicate current behavior)
-weight_excess: 0.0    # credit for r_p - r_f
-weight_alpha:  1.0    # credit for r_p - r_index
+# Portfolio constraints
+rebalance_interval: 5
+max_weight: 0.10
+weight_blocks: 100  # For discrete action space (1% granularity)
+allow_cash: true
+cash_rate_as_rf: true
+on_inactive: to_cash  # or "pro_rata"
 
-# Reward penalties (initial guesses; will be tuned by the grid below)
+# Transaction costs
+transaction_cost_bps: 20.0
+delist_extra_bps: 20.0  # Extra slippage on forced liquidation
+
+# Observation processing
+normalize_features: true
+obs_clip: 7.5
+include_prev_weights: false
+include_active_flag: false
+global_stats: false
+
+# Reward configuration
+weight_excess: 0.0  # Weight for excess return (r - rf)
+weight_alpha: 1.0   # Weight for alpha (r - index)
+
+# Reward penalties (will be tuned if lambda_grid is provided)
 lambda_turnover: 0.0002
 lambda_hhi: 0.01
 lambda_drawdown: 0.005
+lambda_tail: 0.0  # Set to 0 to disable tail risk penalty
 
-# Tail risk penalty (optional but recommended for credit)
-lambda_tail: 0.50              # strength of ES penalty
-tail_window: 252               # lookback for tail estimation (1Y)
-tail_q: 0.05                   # ES at 5% left tail
-dd_mode: level                 # drawdown penalty uses level (not increment)
+# Tail risk configuration (only used if lambda_tail > 0)
+tail_window: 60
+tail_q: 0.05
+dd_mode: incremental  # or "level"
 
-# =========================
-# Validation / model selection
-# =========================
-# Grid used by validate_reward_params() to pick penalties in-sample.
+# Episode control
+max_steps: null  # null for full episode, or set to integer
+random_reset_frac: 0.0  # For training data augmentation
+
+# ========================
+# Validation Configuration
+# ========================
+
+# In-sample parameter validation
+do_validation: true  # Set to false to skip validation
+validation_timesteps: 1000  # Timesteps for inner validation loop
+validation_split: 0.8  # Train/val split for parameter selection
+selection_metric: ir  # Metric to optimize: "ir", "sharpe", "sortino", "calmar"
+
+# Parameter grid for validation (set to null to skip)
 lambda_grid:
   lambda_turnover: [0.0001, 0.0002, 0.0004]
-  lambda_hhi:      [0.005, 0.01, 0.02]
+  lambda_hhi: [0.005, 0.01, 0.02]
   lambda_drawdown: [0.0025, 0.005, 0.01]
 
-# Choose which metric the grid maximizes; IR = mean(r - idx)/TE (annualized).
-selection_metric: ir
+# ========================
+# Training Structure
+# ========================
 
-n_steps: 12288 # 4096 * 8
-batch_size: 4096 #
+# Walk-forward configuration
+n_folds: 9
+embargo_days: 3
+seeds: "0,1,2"  # Comma-separated string
+
+# Checkpoint and logging
+checkpoint_freq: 100000
+tensorboard_log: true
+verbose: 0  # 0=silent, 1=info, 2=debug
+
+# Parallel training
+n_envs: 8  # Number of parallel environments per training
+n_jobs: 1  # Number of parallel fold/seed combinations
+
+# Training options
+skip_finished: true
+resume_from_checkpoint: true
+episode_len: null  # Set to integer to truncate episodes
+reset_jitter_frac: 0.9  # Randomize starting point in training data
+
+# ========================
+# Evaluation Configuration
+# ========================
+
+evaluation:
+  deterministic: true  # Use deterministic policy
+  save_weights: true  # Save portfolio weights
+  save_topk: true  # Save top-k holdings
+  topk_k: 5  # Number of top holdings to track
+  
+# ========================
+# Baseline Configuration
+# ========================
+
+baselines:
+  strategies: "EW,INDEX,RP_VOL,RP_DURATION,CARRY_TILT,MINVAR"
+  roll_window: 60  # Lookback for risk calculations
+  ridge: 1.0e-4  # Ridge parameter for MINVAR
+
+# =======================
+# Analysis Configuration
+# ========================
+
+analysis:
+  # Bootstrap confidence intervals
+  n_bootstrap: 2000
+  block_size: 21
+  
+  # Sensitivity analysis
+  run_sensitivity: false
+  sensitivity_params: "lambda_turnover,lambda_hhi,lambda_drawdown,transaction_cost_bps"
+  sensitivity_values: "0.5,1.0,2.0"  # Multiplicative factors
+  
+  # Statistical tests
+  dm_pairs: "PPO:EW,PPO:INDEX,PPO:MINVAR,PPO:RP_VOL"
+  var_alpha: 0.95
+  nw_lag: null  # null for automatic  
