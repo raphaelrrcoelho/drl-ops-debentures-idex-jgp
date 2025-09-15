@@ -4,12 +4,10 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 10000
+total_timesteps: 10000  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
-n_steps: 256  # Smaller, more frequent updates
-batch_size: 64  # Faster gradient computations  
-n_envs: 16  # More parallel environments (if memory allows)
-gradient_accumulation_steps: 4  # Simulate larger batches
+n_steps: 4096  # 256 steps × 16 envs = 4096 total steps per rollout
+batch_size: 512  # Smaller batches for minibatch SGD (must divide n_steps)
 n_epochs: 5
 gamma: 0.99
 gae_lambda: 0.95
@@ -50,7 +48,7 @@ global_stats: false
 weight_excess: 0.0  # Weight for excess return (r - rf)
 weight_alpha: 1.0   # Weight for alpha (r - index)
 
-# Reward penalties (will be tuned if lambda_grid is provided)
+# Reward penalties
 lambda_turnover: 0.0002
 lambda_hhi: 0.01
 lambda_drawdown: 0.005
@@ -62,8 +60,8 @@ tail_q: 0.05
 dd_mode: incremental  # or "level"
 
 # Episode control
-max_steps: null  # null for full episode, or set to integer
-random_reset_frac: 0.0  # For training data augmentation
+max_steps: 256  # Episode length matches steps per env per rollout
+random_reset_frac: 0.9  # For training data augmentation
 
 # ========================
 # Validation Configuration
@@ -76,10 +74,7 @@ validation_split: 0.8  # Train/val split for parameter selection
 selection_metric: ir  # Metric to optimize: "ir", "sharpe", "sortino", "calmar"
 
 # Parameter grid for validation (set to null to skip)
-lambda_grid:
-  lambda_turnover: [0.0001, 0.0002, 0.0004]
-  lambda_hhi: [0.005, 0.01, 0.02]
-  lambda_drawdown: [0.0025, 0.005, 0.01]
+lambda_grid: null  # Disabled for faster training
 
 # ========================
 # Training Structure
@@ -91,19 +86,20 @@ embargo_days: 3
 seeds: "0,1,2"  # Comma-separated string
 
 # Checkpoint and logging
-checkpoint_freq: 100000
+checkpoint_freq: 50000
 tensorboard_log: true
 verbose: 0  # 0=silent, 1=info, 2=debug
 
 # Parallel training
-#n_envs: 8  # Number of parallel environments per training
+n_envs: 16  # Number of parallel environments per training
 n_jobs: 1  # Number of parallel fold/seed combinations
 
 # Training options
 skip_finished: true
 resume_from_checkpoint: true
-episode_len: 256  # Set to integer to truncate episodes
+episode_len: 256  # Set to match max_steps for consistency
 reset_jitter_frac: 0.9  # Randomize starting point in training data
+vec: subproc  # Use subprocess vectorization for parallel envs
 
 # ========================
 # Evaluation Configuration
@@ -141,4 +137,4 @@ analysis:
   # Statistical tests
   dm_pairs: "PPO:EW,PPO:INDEX,PPO:MINVAR,PPO:RP_VOL"
   var_alpha: 0.95
-  nw_lag: null  # null for automatic  
+  nw_lag: null  # null for automatic
