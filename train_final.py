@@ -361,6 +361,26 @@ def train_one(
     except Exception as e:
         print(f"[WARN] Could not persist union ids: {e}")
     
+    # CRITICAL FIX: Adjust n_steps to ensure proper training length
+    # Calculate n_steps that will work well with n_envs and total_timesteps
+    actual_n_envs = max(1, int(n_envs))
+    
+    # We want n_steps * n_envs to be a reasonable fraction of total_timesteps
+    # and n_steps must be divisible by batch_size
+    target_rollout = min(ppo_cfg.total_timesteps // 10, 2048)  # Aim for ~10 rollouts
+    calculated_n_steps = max(64, target_rollout // actual_n_envs)
+    
+    # Round to nearest multiple of batch_size
+    calculated_n_steps = max(ppo_cfg.batch_size, 
+                             (calculated_n_steps // ppo_cfg.batch_size) * ppo_cfg.batch_size)
+    
+    # Update PPO config with calculated n_steps
+    adjusted_ppo_cfg = PPOConfig(**asdict(ppo_cfg))
+    adjusted_ppo_cfg.n_steps = calculated_n_steps
+    
+    print(f"  Adjusted n_steps: {calculated_n_steps} (n_envs={actual_n_envs}, "
+          f"rollout_size={calculated_n_steps * actual_n_envs})")
+    
     # Build environment
     def _make_thunk(rank: int):
         def _init():
@@ -378,19 +398,19 @@ def train_one(
             return e
         return _init
     
-    thunks = [_make_thunk(i) for i in range(max(1, int(n_envs)))]
+    thunks = [_make_thunk(i) for i in range(actual_n_envs)]
     
-    if int(n_envs) <= 1 or str(vec_kind).lower() == "dummy":
+    if actual_n_envs <= 1 or str(vec_kind).lower() == "dummy":
         vec_env = DummyVecEnv(thunks)
     else:
         vec_env = SubprocVecEnv(thunks, start_method="forkserver")
     
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, 
-                           clip_obs=10.0, clip_reward=10.0, gamma=ppo_cfg.gamma)
+                           clip_obs=10.0, clip_reward=10.0, gamma=adjusted_ppo_cfg.gamma)
     
     # Create model
     set_global_seed(seed=seed)
-    policy_kwargs = _policy_kwargs_from_cfg(ppo_cfg)
+    policy_kwargs = _policy_kwargs_from_cfg(adjusted_ppo_cfg)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     already_trained = 0
@@ -408,20 +428,20 @@ def train_one(
     
     if model is None:
         model = MaskablePPO(
-            ppo_cfg.policy,
+            adjusted_ppo_cfg.policy,
             vec_env,
-            learning_rate=ppo_cfg.learning_rate,
-            n_steps=ppo_cfg.n_steps,
-            batch_size=ppo_cfg.batch_size,
-            n_epochs=ppo_cfg.n_epochs,
-            gamma=ppo_cfg.gamma,
-            gae_lambda=ppo_cfg.gae_lambda,
-            clip_range=ppo_cfg.clip_range,
-            clip_range_vf=ppo_cfg.clip_range_vf,
-            ent_coef=ppo_cfg.ent_coef,
-            vf_coef=ppo_cfg.vf_coef,
-            max_grad_norm=ppo_cfg.max_grad_norm,
-            target_kl=ppo_cfg.target_kl,
+            learning_rate=adjusted_ppo_cfg.learning_rate,
+            n_steps=adjusted_ppo_cfg.n_steps,
+            batch_size=adjusted_ppo_cfg.batch_size,
+            n_epochs=adjusted_ppo_cfg.n_epochs,
+            gamma=adjusted_ppo_cfg.gamma,
+            gae_lambda=adjusted_ppo_cfg.gae_lambda,
+            clip_range=adjusted_ppo_cfg.clip_range,
+            clip_range_vf=adjusted_ppo_cfg.clip_range_vf,
+            ent_coef=adjusted_ppo_cfg.ent_coef,
+            vf_coef=adjusted_ppo_cfg.vf_coef,
+            max_grad_norm=adjusted_ppo_cfg.max_grad_norm,
+            target_kl=adjusted_ppo_cfg.target_kl,
             tensorboard_log=tb_dir,
             policy_kwargs=policy_kwargs,
             verbose=0,
@@ -429,7 +449,7 @@ def train_one(
         )
     
     # Train
-    remaining = max(0, int(ppo_cfg.total_timesteps) - int(already_trained))
+    remaining = max(0, int(adjusted_ppo_cfg.total_timesteps) - int(already_trained))
     callbacks = []
     callbacks.append(CheckpointCallback(save_freq=save_freq, save_path=ckpt_dir, 
                                        name_prefix="ppo_checkpoint"))
@@ -441,7 +461,7 @@ def train_one(
         print(f"[INFO] Nothing left to train (remaining=0). Saving model and exiting.")
     else:
         print(f"[INFO] Training fold {fold_i} seed {seed} for {remaining:,} timesteps "
-              f"(n_envs={n_envs}, discrete action space, {len(union_ids)} assets)")
+              f"(n_envs={actual_n_envs}, discrete action space, {len(union_ids)} assets)")
         model.learn(total_timesteps=int(remaining), callback=callback, progress_bar=True)
     
     # Save
@@ -482,29 +502,39 @@ def main():
     parser.add_argument("--universe", type=str, choices=["cdi", "infra"], required=True)
     parser.add_argument("--data_dir", type=str, default="data")
     parser.add_argument("--out_base", type=str, default=".")
-    parser.add_argument("--n_folds", type=int, default=9)
-    parser.add_argument("--embargo_days", type=int, default=3)
-    parser.add_argument("--seeds", type=str, default="0,1,2")
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--skip_finished", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--n_envs", type=int, default=16)
-    parser.add_argument("--episode_len", type=int, default=256)
-    parser.add_argument("--vec", type=str, default="dummy", choices=["dummy","subproc"])
+    
+    # These args now serve only as overrides if explicitly provided
+    parser.add_argument("--n_folds", type=int, default=None)
+    parser.add_argument("--embargo_days", type=int, default=None)
+    parser.add_argument("--seeds", type=str, default=None)
+    parser.add_argument("--n_envs", type=int, default=None)
+    parser.add_argument("--episode_len", type=int, default=None)
+    parser.add_argument("--vec", type=str, default=None)
     
     args = parser.parse_args()
     
-    # Load config
+    # Load config FIRST
     config = {}
     if os.path.exists(args.config):
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
     
+    # CRITICAL FIX: Use config values as primary, args only if explicitly provided
+    n_folds = args.n_folds if args.n_folds is not None else config.get('n_folds', 9)
+    embargo_days = args.embargo_days if args.embargo_days is not None else config.get('embargo_days', 3)
+    seeds = args.seeds if args.seeds is not None else config.get('seeds', '0,1,2')
+    n_envs = args.n_envs if args.n_envs is not None else config.get('n_envs', 16)
+    episode_len = args.episode_len if args.episode_len is not None else config.get('episode_len', None)
+    vec_kind = args.vec if args.vec is not None else config.get('vec', 'dummy')
+    
     universe = args.universe.lower()
     panel = _load_panel_for_universe(universe, args.data_dir)
     
     dates = panel.index.get_level_values("date").unique().sort_values()
-    fold_specs = folds_from_dates(dates, n_folds=args.n_folds, embargo_days=args.embargo_days)
+    fold_specs = folds_from_dates(dates, n_folds=n_folds, embargo_days=embargo_days)
     
     # Save fold specs
     results_dir = os.path.join(args.out_base, "results", universe)
@@ -512,17 +542,17 @@ def main():
     with open(os.path.join(results_dir, "training_folds.json"), "w") as f:
         json.dump(fold_specs, f, indent=2)
     
-    # PPO config
+    # PPO config from YAML
     net_arch = config.get('net_arch', [128, 128])
     if isinstance(net_arch, list):
         net_arch = tuple(net_arch)
     
     ppo_cfg = PPOConfig(
         policy=config.get('policy', 'MultiInputPolicy'),
-        total_timesteps=config.get('total_timesteps', 100_000),
+        total_timesteps=config.get('total_timesteps', 10000),
         learning_rate=config.get('learning_rate', 5e-6),
-        n_steps=config.get('n_steps', 2048),
-        batch_size=config.get('batch_size', 256),
+        n_steps=config.get('n_steps', 512),  # Will be adjusted in train_one
+        batch_size=config.get('batch_size', 64),
         n_epochs=config.get('n_epochs', 5),
         gamma=config.get('gamma', 0.99),
         gae_lambda=config.get('gae_lambda', 0.95),
@@ -537,7 +567,7 @@ def main():
         ortho_init=bool(config.get('ortho_init', True)),
     )
     
-    # Env config
+    # Env config from YAML
     env_cfg = EnvConfig(
         rebalance_interval=config.get('rebalance_interval', 5),
         max_weight=config.get('max_weight', 0.10),
@@ -571,15 +601,17 @@ def main():
         json.dump({
             "ppo_config": asdict(ppo_cfg),
             "env_config": asdict(env_cfg),
-            "seeds": args.seeds,
-            "n_folds": args.n_folds,
+            "seeds": seeds,
+            "n_folds": n_folds,
+            "n_envs": n_envs,
+            "vec": vec_kind,
         }, f, indent=2)
     
     # Train
-    seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip() != ""]
+    seeds_list = [int(s.strip()) for s in seeds.split(",") if s.strip() != ""]
     
     for fold in fold_specs:
-        for sd in seeds:
+        for sd in seeds_list:
             set_global_seed(seed=sd)
             
             if args.skip_finished:
@@ -597,9 +629,9 @@ def main():
                 out_base=args.out_base,
                 save_freq=config.get('checkpoint_freq', 50_000),
                 resume=args.resume,
-                n_envs=args.n_envs,
-                vec_kind=args.vec,
-                episode_len=args.episode_len,
+                n_envs=n_envs,
+                vec_kind=vec_kind,
+                episode_len=episode_len,
             )
 
 if __name__ == "__main__":
