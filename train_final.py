@@ -13,6 +13,8 @@ import os, json, time, argparse, random, yaml, re
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Tuple, Optional
 
+import hashlib
+
 import numpy as np
 import pandas as pd
 
@@ -381,29 +383,45 @@ def train_one(
     print(f"  Adjusted n_steps: {calculated_n_steps} (n_envs={actual_n_envs}, "
           f"rollout_size={calculated_n_steps * actual_n_envs})")
     
-    # Build environment
+    # Pre-process data in main process to avoid race conditions
+    print("[INFO] Pre-processing data in main process...")
+    # Compute panel hash ONCE in main process
+    date_range = train_aug.index.get_level_values("date")
+    panel_hash = hashlib.sha256(
+        f"{train_aug.shape}_{date_range.min()}_{date_range.max()}_{len(train_aug.index.get_level_values('debenture_id').unique())}".encode()
+    ).hexdigest()[:16]
+    print(f"[INFO] Panel hash: {panel_hash}")
+
+    # Create dummy env to initialize memory maps
+    dummy_cfg = EnvConfig(**asdict(env_cfg))
+    dummy_cfg.seed = 42
+    dummy_env = make_env_from_panel(train_aug, panel_hash=panel_hash, **asdict(dummy_cfg))
+    del dummy_env
+
+    # Now create environments - they'll reuse the existing memory maps
     def _make_thunk(rank: int):
         def _init():
-            cfg_i = EnvConfig(**{**asdict(env_cfg)})
-            if cfg_i.seed is not None:
-                cfg_i.seed = int(cfg_i.seed) + int(rank)
+            cfg_i = EnvConfig(**asdict(env_cfg))
+            cfg_i.seed = int(env_cfg.seed or 0) + int(rank)
             
-            if episode_len is not None:
-                cfg_i.max_steps = episode_len
-            
-            e = make_env_from_panel(train_aug, **asdict(cfg_i))
+            # Pass the same panel_hash to all environments
+            e = make_env_from_panel(train_aug, panel_hash=panel_hash, **asdict(cfg_i))
             e = ActionMasker(e, mask_fn)
             e = SafeRewardWrapper(e)
             e = SafeObsWrapper(e, clip=getattr(cfg_i, "obs_clip", 7.5) or 7.5)
             return e
         return _init
-    
+
     thunks = [_make_thunk(i) for i in range(actual_n_envs)]
-    
-    if actual_n_envs <= 1 or str(vec_kind).lower() == "dummy":
-        vec_env = DummyVecEnv(thunks)
+
+    # IMPORTANT: Use 'fork' method on Linux for true memory sharing
+    if actual_n_envs > 1 and str(vec_kind).lower() != "dummy":
+        import multiprocessing
+        if multiprocessing.get_start_method(allow_none=True) != 'fork':
+            multiprocessing.set_start_method('fork', force=True)
+        vec_env = SubprocVecEnv(thunks, start_method="fork")
     else:
-        vec_env = SubprocVecEnv(thunks, start_method="forkserver")
+        vec_env = DummyVecEnv(thunks)
     
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, 
                            clip_obs=10.0, clip_reward=10.0, gamma=adjusted_ppo_cfg.gamma)
@@ -421,7 +439,7 @@ def train_one(
         if cp is not None:
             print(f"[INFO] Resuming fold {fold_i} seed {seed} from: {cp} ({steps} steps)")
             try:
-                model = MaskablePPO.load(cp, env=vec_env, device="auto")
+                model = MaskablePPO.load(cp, env=vec_env, device=device)
                 already_trained = int(getattr(model, "num_timesteps", steps or 0))
             except Exception as e:
                 print(f"[WARN] Failed to load checkpoint; training fresh. Err={e}")

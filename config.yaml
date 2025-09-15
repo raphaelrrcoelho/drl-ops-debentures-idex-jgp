@@ -42,7 +42,7 @@ normalize_features: true
 obs_clip: 7.5
 include_prev_weights: false
 include_active_flag: false
-global_stats: false
+global_stats: true
 
 # Reward configuration
 weight_excess: 0.0  # Weight for excess return (r - rf)
@@ -91,7 +91,7 @@ tensorboard_log: true
 verbose: 0  # 0=silent, 1=info, 2=debug
 
 # Parallel training
-n_envs: 8  # Number of parallel environments per training
+n_envs: 4  # Number of parallel environments per training
 n_jobs: 1  # Number of parallel fold/seed combinations
 
 # Training options
