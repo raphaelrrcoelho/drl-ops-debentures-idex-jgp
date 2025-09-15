@@ -1,31 +1,8 @@
 # evaluate_final.py
 """
-Evaluate PPO on a changing investable universe with integrated sensitivity analysis
------------------------------------------------------------------------
-
-This script evaluates models trained with the "union-of-IDs per fold"
-approach (see train.py). For each (fold × seed):
-
-1) Reads the fold time windows from results/<universe>/training_folds.json
-2) Reads the *exact* union of debenture IDs used during training from
-   results/<universe>/training_union_ids.json (falls back to recomputing if missing)
-3) Builds a TEST panel reindexed to (test_dates × union_ids), filling missing
-   asset-days with safe defaults and ACTIVE=0
-4) Creates an environment over that panel; the env enforces day-by-day ACTIVE
-   gating, so new entrants become investable immediately and delisted names are
-   forced to zero weight (with trading costs)
-5) Loads the PPO model for that (fold, seed) and simulates step-by-step with
-   deterministic policy
-6) Saves:
-   - results/<universe>/fold_<i>_seed_<j>_results.pkl (timeseries & weights)
-   - results/<universe>/fold_metrics.csv (append row with metrics)
-   - results/<universe>/all_returns.csv (long format: date,strategy,return)
-   - results/<universe>/all_diagnostics.csv (long format)
-   - results/<universe>/all_metrics.csv (append row per run)
-
-New: Integrated sensitivity analysis for reward parameters and transaction costs
+Evaluate MaskablePPO with discrete actions on fold-specific asset universes
+Includes sensitivity analysis for transaction costs and reward parameters
 """
-
 from __future__ import annotations
 
 import os
@@ -33,23 +10,23 @@ import json
 import argparse
 import itertools
 from dataclasses import asdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 # SB3
 try:
-    from stable_baselines3 import PPO
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize  
+    from sb3_contrib import MaskablePPO
+    from sb3_contrib.common.wrappers import ActionMasker
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 except Exception as e:
-    raise RuntimeError("stable-baselines3 is required. Please `pip install stable-baselines3`") from e
+    raise RuntimeError("sb3-contrib and stable-baselines3 are required.") from e
 
 # Our env
-from env_final import make_env_from_panel, EnvConfig  # env applies costs & yields diagnostics.
+from env_final import make_env_from_panel, EnvConfig
 
 TRADING_DAYS = 252.0
-
 
 # ------------------------------ IO helpers -------------------------------- #
 
@@ -77,7 +54,6 @@ def append_row_csv(path: str, row: dict, cols_order: Optional[List[str]] = None)
 def append_long_csv(path: str, df_new: pd.DataFrame, sort_by: Optional[List[str]] = None):
     if os.path.exists(path):
         df = pd.read_csv(path, parse_dates=["date"])
-        # ensure columns superset to avoid dtype upcast surprises
         for c in df_new.columns:
             if c not in df.columns:
                 df[c] = np.nan
@@ -87,7 +63,6 @@ def append_long_csv(path: str, df_new: pd.DataFrame, sort_by: Optional[List[str]
     if sort_by:
         df = df.sort_values(sort_by)
     df.to_csv(path, index=False)
-
 
 # --------------------------- Panel / calendar ----------------------------- #
 
@@ -106,31 +81,34 @@ def _date_level_map(panel: pd.DataFrame, col: str) -> pd.Series:
     return panel[[col]].groupby(level="date").first()[col].sort_index()
 
 def union_ids_from_training(results_dir: str, fold: int) -> Optional[List[str]]:
+    """Load the union IDs that were used during training for this fold"""
     path = os.path.join(results_dir, "training_union_ids.json")
     if not os.path.exists(path):
         return None
-    data = read_json(path)  # list of {"fold": i, "ids": [...]}
+    data = read_json(path)
     for rec in data:
         if int(rec.get("fold", -1)) == int(fold):
             return [str(x) for x in rec.get("ids", [])]
     return None
 
 def compute_union_ids_from_panel(panel: pd.DataFrame, fold_cfg: Dict[str, str]) -> List[str]:
+    """Fallback: compute union IDs from panel if file is missing"""
     train_start = pd.to_datetime(fold_cfg["train_start"])
-    test_end    = pd.to_datetime(fold_cfg["test_end"])
+    test_end = pd.to_datetime(fold_cfg["test_end"])
     sl = panel.loc[
         (panel.index.get_level_values("date") >= train_start) &
         (panel.index.get_level_values("date") <= test_end)
     ]
     return sl.index.get_level_values("debenture_id").unique().astype(str).tolist()
 
-def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str], union_ids: List[str]) -> pd.DataFrame:
+def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str], 
+                                union_ids: List[str]) -> pd.DataFrame:
     """
     TEST dates × UNION IDS; missing pairs => ACTIVE=0 and safe feature fills.
     Mirrors the baselines' dynamic universe preparation.
     """
     test_start = pd.to_datetime(fold_cfg["test_start"])
-    test_end   = pd.to_datetime(fold_cfg["test_end"])
+    test_end = pd.to_datetime(fold_cfg["test_end"])
 
     dates = panel.index.get_level_values("date").unique().sort_values()
     test_dates = dates[(dates >= test_start) & (dates <= test_end)]
@@ -168,7 +146,6 @@ def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str], u
 
     return test_aug
 
-
 # ------------------------------ Metrics ---------------------------------- #
 
 def wealth_from_returns(r: pd.Series) -> pd.Series:
@@ -204,7 +181,6 @@ def compute_metrics(returns: pd.Series, rf: pd.Series, bench: pd.Series) -> Dict
     vol_ann = float(sd * np.sqrt(TRADING_DAYS))
     calmar = float(cagr / abs(mdd)) if mdd < 0 else np.nan
 
-    # Optionally alpha vs bench if you store it; here we keep core metrics.
     return {
         "CAGR": cagr,
         "Vol_ann": vol_ann,
@@ -213,7 +189,6 @@ def compute_metrics(returns: pd.Series, rf: pd.Series, bench: pd.Series) -> Dict
         "MaxDD": mdd,
         "Calmar": calmar,
     }
-
 
 # ------------------------- Weights serialization ------------------------- #
 
@@ -259,6 +234,20 @@ def write_topk_holdings_snapshot(results_dir: str,
         path = os.path.join(results_dir, "topk_holdings.csv")
         append_long_csv(path, df_top, sort_by=["date", "strategy", "rank"])
 
+# ------------------------- Mask function for discrete -------------------- #
+
+def mask_fn(env):
+    """Action mask function for MaskablePPO"""
+    if hasattr(env, 'get_action_masks'):
+        masks = env.get_action_masks()
+        if isinstance(masks, list):
+            return np.concatenate([m.flatten() for m in masks])
+        return masks
+    else:
+        if hasattr(env, 'action_space') and hasattr(env.action_space, 'nvec'):
+            total_actions = sum(env.action_space.nvec)
+            return np.ones(total_actions, dtype=bool)
+        return np.ones(100, dtype=bool)
 
 # ------------------------- Sensitivity Analysis --------------------------- #
 
@@ -269,6 +258,8 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
     Run sensitivity analysis by varying parameters and evaluating performance
     """
     print(f"[SENSITIVITY] Starting analysis for {strategy_label}")
+    
+    import dataclasses
     
     # Generate all combinations of parameter variations
     param_names = list(param_variations.keys())
@@ -285,24 +276,47 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
         
         # Create environment with modified config
         env = make_env_from_panel(test_panel, **modified_cfg)
+        env = ActionMasker(env, mask_fn)
         venv = DummyVecEnv([lambda: env])
         
-        vecnorm_path = os.path.join(models_dir, f"vecnorm_fold_{fold}_seed_{seed}.pkl")
+        # Load VecNormalize if available
+        vecnorm_path = os.path.join(results_dir, "..", "models", strategy_label.split("_")[0].lower(), 
+                                    "ppo", f"vecnorm_fold_{fold}_seed_{seed}.pkl")
         if os.path.exists(vecnorm_path):
             venv = VecNormalize.load(vecnorm_path, venv)
-            venv.training = False     # freeze stats
-            venv.norm_reward = False  # use raw rewards; you read returns from info
-        env = venv
+            venv.training = False
+            venv.norm_reward = False
+        
         # Load model
-        model = PPO.load(model_path, device="cpu")
-        obs = venv.reset()[0]
-        for t in range(len(test_dates)):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, _, terminated, truncated, info = venv.step(action)
-            i = info[0] if isinstance(info, (list, tuple)) else info
+        model = MaskablePPO.load(model_path, device="cpu")
         
         # Run evaluation
-        eval_results = evaluate_model(env, model, test_panel.index.get_level_values("date").unique())
+        obs = venv.reset()
+        test_dates = test_panel.index.get_level_values("date").unique()
+        returns = []
+        diagnostics = []
+        
+        for t in range(len(test_dates)):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, rewards, dones, infos = venv.step(action)
+            info = infos[0] if isinstance(infos, (list, tuple)) else infos
+            
+            # Store results
+            returns.append(info.get("portfolio_return", 0.0))
+            diagnostics.append({
+                "turnover": info.get("turnover", 0.0),
+                "hhi": info.get("hhi", 0.0),
+                "wealth": info.get("wealth", 1.0)
+            })
+            
+            if np.any(dones):
+                break
+        
+        # Calculate metrics
+        returns_series = pd.Series(returns)
+        rf_series = pd.Series(0.0, index=range(len(returns)))
+        idx_series = pd.Series(0.0, index=range(len(returns)))
+        metrics = compute_metrics(returns_series, rf_series, idx_series)
         
         # Store results
         result_row = {
@@ -311,11 +325,12 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
             "seed": seed,
             "combo_id": i,
             **{f"param_{param_names[j]}": combo[j] for j in range(len(param_names))},
-            **eval_results["metrics"]
+            **metrics
         }
         results.append(result_row)
         
-        print(f"[SENSITIVITY] Completed combo {i+1}/{len(combinations)}: {dict(zip(param_names, combo))}")
+        print(f"  Combo {i+1}/{len(combinations)}: {dict(zip(param_names, combo))}")
+        venv.close()
     
     # Save sensitivity results
     sensitivity_df = pd.DataFrame(results)
@@ -323,40 +338,6 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
     sensitivity_df.to_csv(sensitivity_path, index=False)
     
     return sensitivity_df
-
-def evaluate_model(env, model, test_dates):
-    """
-    Evaluate a model on an environment and return metrics
-    """
-    obs, _ = env.reset()
-    returns = []
-    diagnostics = []
-    
-    for t in range(len(test_dates)):
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
-        
-        # Store results
-        returns.append(info.get("portfolio_return", 0.0))
-        diagnostics.append({
-            "turnover": info.get("turnover", 0.0),
-            "hhi": info.get("hhi", 0.0),
-            "wealth": info.get("wealth", 1.0)
-        })
-        
-        if terminated or truncated:
-            break
-    
-    # Calculate metrics
-    returns_series = pd.Series(returns)
-    metrics = compute_metrics(returns_series, pd.Series(0.0, index=range(len(returns))), pd.Series(0.0, index=range(len(returns))))
-    
-    return {
-        "metrics": metrics,
-        "returns": returns_series,
-        "diagnostics": diagnostics
-    }
-
 
 # ------------------------------- Main eval -------------------------------- #
 
@@ -445,6 +426,7 @@ def main():
         # Union IDs exactly as in training (fallback to recompute)
         union = union_ids_from_training(res_dir, fold)
         if union is None:
+            print(f"[INFO] Computing union IDs for fold {fold}")
             union = compute_union_ids_from_panel(panel, fcfg)
 
         # Build TEST panel (dates × union_ids)
@@ -452,9 +434,10 @@ def main():
 
         # Build env with SAME config used during training
         env = make_env_from_panel(test_aug, **asdict(env_cfg))
+        env = ActionMasker(env, mask_fn)
 
         # Date-level series for test
-        test_dates = env.dates if hasattr(env, "dates") else test_aug.index.get_level_values("date").unique().sort_values()
+        test_dates = test_aug.index.get_level_values("date").unique().sort_values()
         idx_map = _date_level_map(test_aug, "index_return")
         rf_test = rf_series.reindex(test_dates).fillna(0.0)
         bench_test = idx_map.reindex(test_dates).fillna(0.0)
@@ -476,26 +459,46 @@ def main():
                 print(f"[SENSITIVITY] Completed analysis for {label}")
 
             # Standard evaluation
-            model = PPO.load(model_path, device="cpu")
+            model = MaskablePPO.load(model_path, device="cpu")
 
-            obs, _ = env.reset(seed=seed)
+            # Check for VecNormalize stats
+            vecnorm_path = os.path.join(models_dir, f"vecnorm_fold_{fold}_seed_{seed}.pkl")
+            if os.path.exists(vecnorm_path):
+                venv = DummyVecEnv([lambda: env])
+                venv = VecNormalize.load(vecnorm_path, venv)
+                venv.training = False
+                venv.norm_reward = False
+                env = venv
+
+            # Reset and run episode
+            if hasattr(env, 'num_envs'):  # VecEnv
+                obs = env.reset()
+            else:
+                obs, _ = env.reset(seed=seed)
+
             done = False
 
             # Collectors
             rows_ret = []
             rows_diag = []
             weights_by_date = []
-            asset_ids = list(getattr(env, "asset_ids", getattr(env, "get_asset_ids", lambda: union)()))
-            if callable(asset_ids):
-                asset_ids = asset_ids()
+            asset_ids = list(union)
 
             t = 0
-            while True:
-                t += 1
+            while not done and t < len(test_dates):
                 action, _ = model.predict(obs, deterministic=args.deterministic)
-                obs, reward, terminated, truncated, info = env.step(action)
+                
+                if hasattr(env, 'num_envs'):  # VecEnv
+                    obs, rewards, dones, infos = env.step(action)
+                    info = infos[0] if isinstance(infos, (list, tuple)) else infos
+                    done = dones[0] if isinstance(dones, (list, tuple, np.ndarray)) else dones
+                else:
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    done = terminated or truncated
+
                 # Step date
-                dt = test_dates[min(len(test_dates)-1, t-1)]
+                dt = test_dates[min(len(test_dates)-1, t)]
+                t += 1
 
                 # returns: use NET portfolio return from env (costs already applied internally!)
                 r_p = float(info.get("portfolio_return", 0.0))
@@ -510,7 +513,7 @@ def main():
                     ("alpha", info.get("alpha", np.nan)),
                     ("excess", info.get("excess", np.nan)),
                     ("rf", info.get("rf", np.nan)),
-                    ("idx", info.get("idx", np.nan)),
+                    ("idx", info.get("index_return", np.nan)),
                     ("wealth", info.get("wealth", np.nan)),
                 ]:
                     rows_diag.append({"date": dt, "strategy": label, "metric": m, "value": float(v) if v is not None else np.nan})
@@ -519,15 +522,8 @@ def main():
                 w = info.get("weights", None)
                 if w is not None:
                     w = np.asarray(w, dtype=float).ravel()
-                    if w.size != len(asset_ids):
-                        # In rare cases (e.g., internal env cash asset), align to min len
-                        mlen = min(len(asset_ids), w.size)
-                        w = w[:mlen]
-                        asset_ids = asset_ids[:mlen]
-                    weights_by_date.append((dt, w))
-
-                if terminated or truncated:
-                    break
+                    if w.size == len(asset_ids):
+                        weights_by_date.append((dt, w))
 
             # --- Save long returns & diagnostics ---
             df_ret = pd.DataFrame(rows_ret)
@@ -568,7 +564,9 @@ def main():
             append_row_csv(os.path.join(res_dir, "fold_metrics.csv"), row, cols_order=fold_cols)
             append_row_csv(os.path.join(res_dir, "all_metrics.csv"), row, cols_order=fold_cols)
 
-    print("[DONE] Evaluation complete (no ex-post cost applied; returns are net-of-costs from env).")
+            print(f"  {label}: Sharpe={m['Sharpe']:.3f}, CAGR={m['CAGR']:.3%}")
+
+    print("\n[DONE] Evaluation complete (no ex-post cost applied; returns are net-of-costs from env).")
 
 if __name__ == "__main__":
     main()

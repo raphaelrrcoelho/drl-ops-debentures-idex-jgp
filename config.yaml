@@ -4,7 +4,7 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 10000  # Increased to be meaningful (multiple of n_steps)
+total_timesteps: 12288  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
 n_steps: 4096  # 256 steps × 16 envs = 4096 total steps per rollout
 batch_size: 512  # Smaller batches for minibatch SGD (must divide n_steps)
@@ -91,7 +91,7 @@ tensorboard_log: true
 verbose: 0  # 0=silent, 1=info, 2=debug
 
 # Parallel training
-n_envs: 16  # Number of parallel environments per training
+n_envs: 8  # Number of parallel environments per training
 n_jobs: 1  # Number of parallel fold/seed combinations
 
 # Training options

@@ -1,224 +1,126 @@
 # env_final.py
 """
-Optimized Debenture portfolio environment with DISCRETE action space
-Configuration fully driven by config.yaml
+Debenture portfolio environment with DISCRETE action space for PPO
+-------------------------------------------------------------------
+Modified to use MultiDiscrete actions with 1% allocation blocks.
+Uses SharedDataCache to avoid duplicating data across parallel environments.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, asdict, field
+import hashlib
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
-import yaml
-
-try:
-    from numba import jit, prange
-    HAS_NUMBA = True
-except ImportError:
-    HAS_NUMBA = False
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-    prange = range
 
 # ----------------------------- Configuration ----------------------------- #
 
 @dataclass
 class EnvConfig:
-    """Environment configuration - all parameters from config.yaml"""
-    
-    # Portfolio constraints
-    rebalance_interval: int = 5
-    max_weight: float = 0.10
-    weight_blocks: int = 100  # For discrete action space (1% granularity)
-    allow_cash: bool = True
-    cash_rate_as_rf: bool = True
-    on_inactive: str = "to_cash"  # or "pro_rata"
-    
-    # Transaction costs (in basis points)
-    transaction_cost_bps: float = 20.0
-    delist_extra_bps: float = 20.0  # Extra slippage on forced liquidation
-    
-    # Reward weights
-    weight_excess: float = 0.0  # Weight for excess return (r - rf)
-    weight_alpha: float = 1.0   # Weight for alpha (r - index)
-    
-    # Reward penalties
-    lambda_turnover: float = 0.0002
-    lambda_hhi: float = 0.01
-    lambda_drawdown: float = 0.005
-    lambda_tail: float = 0.0  # Set to 0 to disable
-    
-    # Tail risk parameters (only used if lambda_tail > 0)
-    tail_window: int = 60
-    tail_q: float = 0.05
-    dd_mode: str = "incremental"  # or "level"
-    
-    # Observation configuration
-    include_prev_weights: bool = True
-    include_active_flag: bool = True
-    global_stats: bool = True
-    normalize_features: bool = True
-    obs_clip: float = 5.0
-    
+    # Rebalance & constraints
+    rebalance_interval: int = 5                 # days between applying new action
+    max_weight: float = 0.10                    # per-asset cap
+    weight_blocks: int = 100                    # Total blocks (100 = 1% granularity)
+    allow_cash: bool = True                     # if True, append cash asset
+    cash_rate_as_rf: bool = True                # if cash exists, accrues at rf
+    on_inactive: str = "to_cash"                # {"to_cash","pro_rata"}
+
+    # Costs & penalties
+    weight_excess: float = 0.0   
+    weight_alpha: float = 1.0   
+    transaction_cost_bps: float = 20.0          
+    delist_extra_bps: float = 20.0              
+    lambda_turnover: float = 0.0002             
+    lambda_hhi: float = 0.01                    
+    lambda_drawdown: float = 0.005              
+    lambda_tail: float = 0.0                    
+    tail_window: int = 60                       
+    tail_q: float = 0.05                        
+    dd_mode: str = "incremental"                
+
+    # Observation controls
+    include_prev_weights: bool = False           
+    include_active_flag: bool = True            
+    global_stats: bool = True                   
+    normalize_features: bool = True             
+    obs_clip: float = 5.0                       
+
     # Episode control
-    max_steps: Optional[int] = None
-    random_reset_frac: float = 0.0
-    seed: Optional[int] = 42
+    max_steps: Optional[int] = None             
+    seed: Optional[int] = 42                    
+    random_reset_frac: float = 0.0              
+
+# ------------------------------ Utilities -------------------------------- #
+
+def _blocks_to_weights(blocks: np.ndarray, total_blocks: int = 100) -> np.ndarray:
+    """Convert discrete block allocations to continuous weights."""
+    blocks = np.asarray(blocks, dtype=float)
+    total = blocks.sum()
+    if total <= 0:
+        return np.zeros_like(blocks, dtype=np.float32)
+    return (blocks / total).astype(np.float32)
+
+def _sanitize_blocks_with_mask(blocks: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Zero out blocks for inactive assets."""
+    return blocks * (mask > 0).astype(int)
+
+def _hhi(w: np.ndarray) -> float:
+    return float(np.square(w).sum())
+
+def _turnover(w_new: np.ndarray, w_prev: np.ndarray) -> float:
+    return float(np.abs(w_new - w_prev).sum())
+
+def _dict_sector_exposures(sector_ids: np.ndarray, weights: np.ndarray) -> Dict[int, float]:
+    m = min(len(sector_ids), len(weights))
+    sid = np.asarray(sector_ids[:m])
+    w = np.asarray(weights[:m], dtype=float)
+    d: Dict[int, float] = {}
+    for s in np.unique(sid):
+        if s < 0:
+            continue
+        d[int(s)] = float(w[sid == s].sum())
+    return d
+
+# -------------------------- Shared Data Cache ----------------------------- #
+
+class SharedDataCache:
+    """Cache preprocessed data to share across environments"""
+    _cache: Dict[str, Dict[str, Any]] = {}
+    _printed: bool = False
     
     @classmethod
-    def from_yaml(cls, path: str) -> 'EnvConfig':
-        """Load configuration directly from YAML file"""
-        with open(path, 'r') as f:
-            data = yaml.safe_load(f)
+    def get_or_create(cls, panel: pd.DataFrame, config: EnvConfig) -> Dict[str, Any]:
+        # Create a hash of panel and config for caching
+        panel_str = f"{panel.index.tolist()[:5]}_{panel.shape}_{list(panel.columns)}"
+        config_str = str(asdict(config))
+        cache_key = hashlib.md5((panel_str + config_str).encode()).hexdigest()
         
-        # Extract environment parameters from config
-        env_params = {}
+        if cache_key not in cls._cache:
+            if not cls._printed:
+                print("First environment creation - preprocessing data...")
+                cls._printed = True
+            cls._cache[cache_key] = cls._prepare_data(panel, config)
         
-        # Get all fields that belong to EnvConfig
-        for field_name in cls.__annotations__:
-            if field_name in data:
-                env_params[field_name] = data[field_name]
-        
-        # Handle None values
-        for key in ['max_steps', 'seed']:
-            if key in env_params and env_params[key] == 'null':
-                env_params[key] = None
-        
-        return cls(**env_params)
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'EnvConfig':
-        """Create from dictionary with validation"""
-        # Only keep fields that are in the dataclass
-        valid_fields = {}
-        for field_name in cls.__annotations__:
-            if field_name in d:
-                value = d[field_name]
-                # Handle None values
-                if value == 'null' or (isinstance(value, str) and value.lower() == 'none'):
-                    if field_name in ['max_steps', 'seed']:
-                        value = None
-                valid_fields[field_name] = value
-        
-        return cls(**valid_fields)
-    
-    def validate(self) -> None:
-        """Validate configuration parameters"""
-        assert 0 < self.max_weight <= 1.0, f"max_weight must be in (0, 1], got {self.max_weight}"
-        assert self.weight_blocks > 0, f"weight_blocks must be positive, got {self.weight_blocks}"
-        assert self.rebalance_interval > 0, f"rebalance_interval must be positive, got {self.rebalance_interval}"
-        assert self.transaction_cost_bps >= 0, f"transaction_cost_bps must be non-negative, got {self.transaction_cost_bps}"
-        assert self.delist_extra_bps >= 0, f"delist_extra_bps must be non-negative, got {self.delist_extra_bps}"
-        assert self.lambda_turnover >= 0, f"lambda_turnover must be non-negative, got {self.lambda_turnover}"
-        assert self.lambda_hhi >= 0, f"lambda_hhi must be non-negative, got {self.lambda_hhi}"
-        assert self.lambda_drawdown >= 0, f"lambda_drawdown must be non-negative, got {self.lambda_drawdown}"
-        assert self.lambda_tail >= 0, f"lambda_tail must be non-negative, got {self.lambda_tail}"
-        assert self.on_inactive in ["to_cash", "pro_rata"], f"on_inactive must be 'to_cash' or 'pro_rata', got {self.on_inactive}"
-        assert self.dd_mode in ["incremental", "level"], f"dd_mode must be 'incremental' or 'level', got {self.dd_mode}"
-        assert self.obs_clip > 0, f"obs_clip must be positive, got {self.obs_clip}"
-        assert 0 <= self.random_reset_frac <= 1, f"random_reset_frac must be in [0, 1], got {self.random_reset_frac}"
-        
-        if self.lambda_tail > 0:
-            assert self.tail_window > 0, f"tail_window must be positive when lambda_tail > 0, got {self.tail_window}"
-            assert 0 < self.tail_q < 1, f"tail_q must be in (0, 1) when lambda_tail > 0, got {self.tail_q}"
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization"""
-        return asdict(self)
-    
-    def __post_init__(self):
-        """Validate after initialization"""
-        self.validate()
-
-# -------------------------- JIT-compiled utilities ----------------------- #
-
-@jit(nopython=True, cache=True)
-def fast_portfolio_return(weights: np.ndarray, returns: np.ndarray) -> float:
-    """Fast portfolio return calculation"""
-    result = 0.0
-    for i in range(len(weights)):
-        if not np.isnan(returns[i]):
-            result += weights[i] * returns[i]
-    return result
-
-@jit(nopython=True, cache=True)
-def fast_turnover(w_new: np.ndarray, w_prev: np.ndarray) -> float:
-    """Fast turnover calculation"""
-    result = 0.0
-    for i in range(len(w_new)):
-        result += abs(w_new[i] - w_prev[i])
-    return result
-
-@jit(nopython=True, cache=True)
-def fast_hhi(weights: np.ndarray) -> float:
-    """Fast HHI calculation"""
-    result = 0.0
-    for i in range(len(weights)):
-        result += weights[i] * weights[i]
-    return result
-
-@jit(nopython=True, cache=True)
-def fast_blocks_to_weights(blocks: np.ndarray, mask: np.ndarray, max_weight: float) -> np.ndarray:
-    """Convert discrete blocks to continuous weights with mask"""
-    n = len(blocks)
-    weights = np.zeros(n, dtype=np.float32)
-    
-    # Apply mask
-    total = 0.0
-    for i in range(n):
-        if mask[i] > 0:
-            weights[i] = blocks[i]
-            total += blocks[i]
-    
-    # Normalize
-    if total > 0:
-        for i in range(n):
-            weights[i] = min(weights[i] / total, max_weight)
-        
-        # Renormalize after capping
-        total = 0.0
-        for i in range(n):
-            total += weights[i]
-        if total > 0:
-            for i in range(n):
-                weights[i] = weights[i] / total
-    
-    return weights
-
-# ----------------------- Data Preprocessing ----------------------- #
-
-class SharedDataProcessor:
-    """Preprocesses panel data once and provides shared arrays"""
+        return cls._cache[cache_key]
     
     @staticmethod
-    def process_panel(panel: pd.DataFrame, config: EnvConfig) -> Dict[str, Any]:
-        """
-        Process panel once and return numpy arrays.
-        Uses config parameters for feature selection and processing.
-        """
+    def _prepare_data(panel: pd.DataFrame, cfg: EnvConfig) -> Dict[str, Any]:
+        """Prepare all shared data arrays once"""
         panel = panel.sort_index()
         
-        # Required columns check
+        # Required columns
         required = [
             "return", "risk_free", "index_return", "active",
             "spread", "duration", "time_to_maturity", "sector_id", "index_level"
         ]
         for c in required:
             if c not in panel.columns:
-                raise ValueError(f"Missing required column '{c}'")
+                raise ValueError(f"Missing required column '{c}' in panel")
         
-        # Get dimensions
-        dates = panel.index.get_level_values("date").unique().sort_values()
-        asset_ids = panel.index.get_level_values("debenture_id").unique().tolist()
-        n_assets = len(asset_ids)
-        T = len(dates)
-        
-        # Build feature list based on config
+        # Base features (lagged versions)
         base_feats = [
             "return", "spread", "duration", "time_to_maturity",
             "risk_free", "index_return", "ttm_rank",
@@ -229,204 +131,232 @@ class SharedDataProcessor:
             "sector_id",
         ]
         
-        # Add active flag if configured
-        if config.include_active_flag:
+        if cfg.include_active_flag and "active" in panel.columns:
             base_feats.append("active")
         
-        # Ensure lag1 columns exist
         panel = panel.copy()
-        for col in base_feats:
-            if col in panel.columns and col not in ("sector_id", "active"):
-                lag_col = f"{col}_lag1"
-                if lag_col not in panel.columns:
-                    panel[lag_col] = (
-                        panel.groupby(level="debenture_id", sort=False)[col]
-                             .shift(1)
-                             .astype(np.float32)
-                             .fillna(0.0)
-                    )
         
-        # Select feature columns
-        feat_cols = []
-        for c in base_feats:
-            if c in panel.columns:
-                if c in ("sector_id", "active"):
-                    feat_cols.append(c)
-                else:
-                    lag_col = f"{c}_lag1"
-                    if lag_col in panel.columns:
-                        feat_cols.append(lag_col)
+        def ensure_lag1(col: str) -> str:
+            if col in ("sector_id", "active"):
+                return col
+            lag_col = f"{col}_lag1"
+            if lag_col not in panel.columns:
+                panel[lag_col] = (
+                    panel.groupby(level="debenture_id", sort=False)[col]
+                         .shift(1)
+                         .astype(np.float32)
+                         .replace([np.inf, -np.inf], np.nan)
+                         .fillna(0.0)
+                )
+            return lag_col
         
-        # Add z-score columns
-        z_cols = [c for c in panel.columns if (c.endswith("_z") or c.endswith("_z252") or "_z_" in c)]
-        for zc in sorted(z_cols):
-            if zc not in feat_cols:
-                feat_cols.append(zc)
+        feat_cols = [ensure_lag1(c) for c in base_feats if c in panel.columns]
+        feat_cols = [c for c in feat_cols if "index_weight" not in c]
         
-        # Convert to wide arrays
-        print(f"  Converting to wide arrays: {T} dates × {n_assets} assets")
+        z_like = [c for c in panel.columns if (c.endswith("_z") or c.endswith("_z252") or "_z_" in c)]
+        for zc in sorted(z_like):
+            lagc = ensure_lag1(zc)
+            if lagc not in feat_cols:
+                feat_cols.append(lagc)
         
-        # Returns
-        R = panel.pivot_table(
-            index="date", columns="debenture_id", values="return"
-        ).reindex(index=dates, columns=asset_ids).fillna(0.0).to_numpy(dtype=np.float32)
+        for c in feat_cols:
+            if c not in panel.columns:
+                panel[c] = 0.0
         
-        # Risk-free and index
-        RF = panel.groupby(level="date")["risk_free"].first().reindex(dates).fillna(0.0).to_numpy(dtype=np.float32)
-        IDX = panel.groupby(level="date")["index_return"].first().reindex(dates).fillna(0.0).to_numpy(dtype=np.float32)
+        # Dates and asset IDs
+        dates = panel.index.get_level_values("date").unique().sort_values()
+        dates_array = dates.to_numpy()
+        asset_ids = panel.index.get_level_values("debenture_id").unique().tolist()
+        asset_ids_list = list(asset_ids)
+        n_assets = len(asset_ids_list)
         
-        # Active mask
-        ACT = panel.pivot_table(
-            index="date", columns="debenture_id", values="active"
-        ).reindex(index=dates, columns=asset_ids).fillna(0.0).to_numpy(dtype=np.float32)
+        if not SharedDataCache._printed:
+            print(f"  Converting to wide arrays: {len(dates)} dates × {len(asset_ids)} assets")
         
-        # Features tensor
-        F = len(feat_cols)
-        X = np.zeros((T, n_assets, F), dtype=np.float32)
-        for f_idx, col in enumerate(feat_cols):
-            if col in panel.columns:
-                wide = panel.pivot_table(
-                    index="date", columns="debenture_id", values=col
-                ).reindex(index=dates, columns=asset_ids).fillna(0.0).to_numpy(dtype=np.float32)
-                X[:, :, f_idx] = wide
-        
-        # Sector IDs
-        sector_ids = (
-            panel.groupby(level="debenture_id")["sector_id"]
-                 .first()
-                 .reindex(asset_ids)
-                 .fillna(-1)
-                 .to_numpy(dtype=np.int16)
+        # Arrays (same-day returns, same-day active mask)
+        R = (
+            panel["return"].reset_index()
+                 .pivot(index="date", columns="debenture_id", values="return")
+                 .reindex(index=dates, columns=asset_ids)
+        )
+        RF = (
+            panel.reset_index()[["date", "risk_free"]]
+                 .drop_duplicates(subset=["date"], keep="last")
+                 .set_index("date")
+                 .reindex(dates)["risk_free"]
+                 .fillna(0.0)
+        )
+        IDX = (
+            panel.reset_index()[["date", "index_return"]]
+                 .drop_duplicates(subset=["date"], keep="last")
+                 .set_index("date")
+                 .reindex(dates)["index_return"]
+                 .fillna(0.0)
+        )
+        A = (
+            panel["active"].reset_index()
+                 .pivot(index="date", columns="debenture_id", values="active")
+                 .reindex(index=dates, columns=asset_ids)
+                 .fillna(0.0)
         )
         
-        # Add cash if configured
-        if config.allow_cash:
-            # Append cash asset with returns based on config
-            cash_R = RF.reshape(-1, 1) if config.cash_rate_as_rf else np.zeros((T, 1), dtype=np.float32)
-            cash_X = np.zeros((T, 1, F), dtype=np.float32)
-            cash_A = np.ones((T, 1), dtype=np.float32)
-            
-            R = np.concatenate([R, cash_R], axis=1)
-            X = np.concatenate([X, cash_X], axis=1)
-            ACT = np.concatenate([ACT, cash_A], axis=1)
-            asset_ids.append("__CASH__")
-            n_assets += 1
+        # Feature tensor (lagged)
+        feat_mats: List[np.ndarray] = []
+        for c in feat_cols:
+            wide = (
+                panel[c].reset_index()
+                     .pivot(index="date", columns="debenture_id", values=c)
+                     .reindex(index=dates, columns=asset_ids)
+                     .fillna(0.0)
+                     .to_numpy(dtype=np.float32)
+            )
+            feat_mats.append(wide)
+        X = np.stack(feat_mats, axis=-1) if feat_mats else np.zeros((len(dates), len(asset_ids), 0), dtype=np.float32)
         
-        # Compute normalization stats if configured
-        global_means = None
-        global_stds = None
-        if config.global_stats and F > 0:
-            act = (ACT > 0).astype(np.float32)
+        # Sector IDs
+        sector_id_wide = (
+            panel["sector_id"].reset_index()
+                 .pivot(index="date", columns="debenture_id", values="sector_id")
+                 .reindex(index=dates, columns=asset_ids)
+                 .ffill().bfill().fillna(-1)
+        )
+        sector_ids = sector_id_wide.to_numpy(dtype=np.int16)[0]
+        
+        # Convert to numpy arrays
+        R_array = np.nan_to_num(R.to_numpy(dtype=np.float32), nan=0.0)
+        RF_array = np.nan_to_num(RF.to_numpy(dtype=np.float32).ravel(), nan=0.0)
+        IDX_array = np.nan_to_num(IDX.to_numpy(dtype=np.float32).ravel(), nan=0.0)
+        ACT_array = np.nan_to_num(A.to_numpy(dtype=np.float32), nan=0.0)
+        X_array = np.nan_to_num(X, nan=0.0)
+        T = R_array.shape[0]
+        F = X_array.shape[-1] if X_array.ndim == 3 else 0
+        
+        # Cross-sectional stats
+        if cfg.global_stats and F > 0:
+            act = (ACT_array > 0).astype(np.float32)
             denom = np.maximum(act.sum(axis=1, keepdims=True), 1.0)
-            means = (X * act[..., None]).sum(axis=1, keepdims=True) / denom[..., None]
-            stds = np.sqrt(((X - means) ** 2 * act[..., None]).sum(axis=1, keepdims=True) / denom[..., None])
+            means = (X_array * act[..., None]).sum(axis=1, keepdims=True) / denom[..., None]
+            stds = np.sqrt(((X_array - means) ** 2 * act[..., None]).sum(axis=1, keepdims=True) / denom[..., None])
             global_means = means.squeeze(1)
             global_stds = np.maximum(stds.squeeze(1), 1e-6)
-            
-            # Apply normalization if configured
-            if config.normalize_features:
-                for f in range(F):
-                    mu = global_means[:, f][:, None]
-                    sd = global_stds[:, f][:, None]
-                    X[:, :, f] = np.clip((X[:, :, f] - mu) / (sd + 1e-6), -config.obs_clip, config.obs_clip)
+        else:
+            global_means = None
+            global_stds = None
+        
+        # Z-normalization
+        if cfg.normalize_features and F > 0:
+            Xn = X_array.copy()
+            eps = 1e-6
+            for f in range(F):
+                mu = global_means[:, f][:, None] if global_means is not None else 0.0
+                sd = global_stds[:, f][:, None] if global_stds is not None else 1.0
+                Xn[:, :, f] = (Xn[:, :, f] - mu) / (sd + eps)
+            X_array = np.clip(Xn, -cfg.obs_clip, cfg.obs_clip)
         
         # Lagged RF/IDX for observations
-        RF_obs = np.zeros_like(RF)
-        RF_obs[1:] = RF[:-1]
-        IDX_obs = np.zeros_like(IDX)
-        IDX_obs[1:] = IDX[:-1]
+        RF_obs = np.zeros_like(RF_array, dtype=np.float32)
+        RF_obs[1:] = RF_array[:-1]
+        IDX_obs = np.zeros_like(IDX_array, dtype=np.float32)
+        IDX_obs[1:] = IDX_array[:-1]
+        
+        # Append cash if enabled
+        if cfg.allow_cash:
+            if cfg.cash_rate_as_rf:
+                cash_R = RF_array.reshape(-1, 1)
+            else:
+                cash_R = np.zeros((T, 1), dtype=np.float32)
+            cash_X = np.zeros((T, 1, F), dtype=np.float32)
+            cash_A = np.ones((T, 1), dtype=np.float32)
+            R_array = np.concatenate([R_array, cash_R], axis=1)
+            X_array = np.concatenate([X_array, cash_X], axis=1) if F > 0 else X_array
+            ACT_array = np.concatenate([ACT_array, cash_A], axis=1)
+            asset_ids_list.append("__CASH__")
+            n_assets += 1
         
         return {
-            'R': R,
-            'RF': RF,
-            'IDX': IDX,
-            'ACT': ACT,
-            'X': X,
-            'RF_obs': RF_obs,
-            'IDX_obs': IDX_obs,
-            'dates': dates.to_numpy(),
-            'asset_ids': asset_ids,
+            'R': R_array,
+            'RF': RF_array,
+            'IDX': IDX_array,
+            'ACT': ACT_array,
+            'X': X_array,
+            'T': T,
+            'F': F,
+            'dates': dates_array,
+            'asset_ids': asset_ids_list,
+            'n_assets': n_assets,
             'sector_ids': sector_ids,
-            'feature_cols': feat_cols,
+            'feature_cols': list(feat_cols),
             'global_means': global_means,
             'global_stds': global_stds,
-            'T': T,
-            'n_assets': n_assets,
-            'F': F,
-            'cash_idx': n_assets - 1 if config.allow_cash else None
+            'RF_obs': RF_obs,
+            'IDX_obs': IDX_obs,
+            'cash_idx': n_assets - 1 if cfg.allow_cash else None,
         }
 
-# -------------------------- Shared Data Environment ---------------------- #
+# ------------------------------ Environment ------------------------------- #
 
-class SharedDataEnv(gym.Env):
-    """Environment that uses shared preprocessed data and config parameters"""
-    
+class DebentureTradingEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
-    _shared_data: Optional[Dict[str, Any]] = None
-    
-    @classmethod
-    def set_shared_data(cls, data: Dict[str, Any]):
-        """Set shared data for all instances"""
-        cls._shared_data = data
-    
-    def __init__(self, config: EnvConfig):
+
+    def __init__(self, panel: pd.DataFrame, config: EnvConfig):
         super().__init__()
-        
-        if self._shared_data is None:
-            raise RuntimeError("Must call SharedDataEnv.set_shared_data() before creating environments")
-        
-        # Store and validate config
+        assert isinstance(panel.index, pd.MultiIndex), "panel must be MultiIndex (date, debenture_id)"
         self.cfg = config
-        self.cfg.validate()
+        if self.cfg.seed is not None:
+            np.random.seed(int(self.cfg.seed))
         
-        # Reference shared arrays (no copying!)
-        self.R = self._shared_data['R']
-        self.RF = self._shared_data['RF']
-        self.IDX = self._shared_data['IDX']
-        self.ACT = self._shared_data['ACT']
-        self.X = self._shared_data['X']
-        self.RF_obs = self._shared_data['RF_obs']
-        self.IDX_obs = self._shared_data['IDX_obs']
-        self.dates = self._shared_data['dates']
-        self.asset_ids = self._shared_data['asset_ids']
-        self.sector_ids = self._shared_data['sector_ids']
-        self.feature_cols = self._shared_data['feature_cols']
-        self.global_means = self._shared_data['global_means']
-        self.global_stds = self._shared_data['global_stds']
-        self.T = self._shared_data['T']
-        self.n_assets = self._shared_data['n_assets']
-        self.F = self._shared_data['F']
-        self.cash_idx = self._shared_data['cash_idx']
+        # Get shared preprocessed data (only computed once)
+        shared_data = SharedDataCache.get_or_create(panel, config)
         
-        # Setup action/observation spaces based on config
+        # Reference shared arrays (not copy!)
+        self.R = shared_data['R']
+        self.RF = shared_data['RF']
+        self.IDX = shared_data['IDX']
+        self.ACT = shared_data['ACT']
+        self.X = shared_data['X']
+        self.T = shared_data['T']
+        self.F = shared_data['F']
+        self.dates = shared_data['dates']
+        self.asset_ids = shared_data['asset_ids']
+        self.n_assets = shared_data['n_assets']
+        self.sector_ids = shared_data['sector_ids']
+        self.feature_cols = shared_data['feature_cols']
+        self.global_means = shared_data['global_means']
+        self.global_stds = shared_data['global_stds']
+        self.RF_obs = shared_data['RF_obs']
+        self.IDX_obs = shared_data['IDX_obs']
+        self.cash_idx = shared_data['cash_idx']
+        
+        # DISCRETE ACTION SPACE
+        # Each asset can get 0 to max_blocks_per_asset blocks
         self.max_blocks_per_asset = int(self.cfg.max_weight * self.cfg.weight_blocks)
         self.action_space = spaces.MultiDiscrete(
             [self.max_blocks_per_asset + 1] * self.n_assets
         )
         
+        # Observation space (unchanged)
         obs_dim = self._obs_size()
         self.observation_space = spaces.Dict({
             'observation': spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
             'action_mask': spaces.Box(0, 1, shape=(self.n_assets,), dtype=np.int8)
         })
         
-        # Instance-specific state (minimal memory footprint)
+        # State (unique per environment)
         self.t: int = 0
-        self.prev_w = np.zeros(self.n_assets, dtype=np.float32)
-        self.curr_w = np.zeros(self.n_assets, dtype=np.float32)
+        self.prev_w: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
+        self.curr_w: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
         self.wealth: float = 1.0
         self.peak_wealth: float = 1.0
-        self.tail_buffer: List[float] = []
-        self._history: Dict[str, list] = {}
         
-        # Set random generator from config
-        if config.seed is not None:
-            self.np_random = np.random.default_rng(config.seed)
-        else:
-            self.np_random = np.random.default_rng()
-    
+        # Tail buffer (optional)
+        self.tail_buffer: List[float] = []
+        
+        # Logs
+        self._history: Dict[str, list] = {}
+
+    # --------------------------- Observation builder ------------------------ #
+
     def _obs_size(self) -> int:
-        """Calculate observation size based on config"""
         n = self.n_assets
         base = n * self.F
         extra = 0
@@ -436,57 +366,64 @@ class SharedDataEnv(gym.Env):
             extra += n
         if self.cfg.global_stats and self.F > 0:
             extra += 2 * self.F
-        extra += 2  # RF and IDX
+        extra += 2  # RF and IDX scalars
         return base + extra
-    
+
     def _get_observation(self) -> Dict:
-        """Build observation based on config settings"""
         t = min(self.t, self.T - 1)
-        
+        if t >= self.ACT.shape[0]:
+            t = self.ACT.shape[0] - 1
+            
         parts: List[np.ndarray] = []
         if self.F > 0:
-            X_t = self.X[t].flatten()
-            parts.append(X_t)
+            X_t = self.X[t].copy()
+            parts.append(X_t.reshape(-1))
         if self.cfg.include_prev_weights:
-            parts.append(self.prev_w)
+            parts.append(self.prev_w.astype(np.float32).ravel())
         if self.cfg.include_active_flag:
-            parts.append(self.ACT[t])
-        if self.cfg.global_stats and self.F > 0 and self.global_means is not None:
-            parts.append(self.global_means[t])
-            parts.append(self.global_stds[t])
-        parts.append(np.array([self.RF_obs[t], self.IDX_obs[t]], dtype=np.float32))
+            parts.append(self.ACT[t].astype(np.float32).ravel())
+        if self.cfg.global_stats and self.F > 0:
+            parts.append(self.global_means[t].astype(np.float32).ravel())
+            parts.append(self.global_stds[t].astype(np.float32).ravel())
+        parts.append(np.array([self.RF_obs[t], self.IDX_obs[t]], dtype=np.float32).ravel())
         
         obs = np.concatenate(parts) if parts else np.zeros((self._obs_size(),), dtype=np.float32)
+        clip = float(self.cfg.obs_clip)
+        obs = np.nan_to_num(obs, nan=0.0, posinf=clip, neginf=-clip)
         mask = self.ACT[t].astype(np.int8)
         
         return {
-            'observation': np.clip(obs, -self.cfg.obs_clip, self.cfg.obs_clip).astype(np.float32),
+            'observation': np.clip(obs, -clip, clip).astype(np.float32),
             'action_mask': mask
         }
-    
+
+    # ------------------------------- Gym API -------------------------------- #
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        
-        # Random start position based on config
-        if self.cfg.max_steps is not None and 0 < self.cfg.random_reset_frac <= 1.0:
+        self.t = 0
+        self.np_random = np.random.default_rng(seed if seed is not None else self.cfg.seed)
+
+        if self.cfg.max_steps is not None and 0 < float(self.cfg.random_reset_frac) <= 1.0:
             max_start = max(0, self.T - int(self.cfg.max_steps))
-            jitter_cap = int(max_start * self.cfg.random_reset_frac)
-            self.t = int(self.np_random.integers(0, jitter_cap + 1)) if jitter_cap > 0 else 0
+            jitter_cap = int(max_start * float(self.cfg.random_reset_frac))
+            start = int(self.np_random.integers(0, jitter_cap + 1)) if jitter_cap > 0 else 0
+            self.t = start
         else:
             self.t = 0
-        
+
         # Initialize weights
         self.prev_w = np.zeros(self.n_assets, dtype=np.float32)
         self.curr_w = np.zeros(self.n_assets, dtype=np.float32)
-        
-        # Start with cash or equal weight based on config
-        if self.cash_idx is not None and self.cfg.allow_cash:
+        # Start with all cash if available
+        if self.cash_idx is not None:
             self.curr_w[self.cash_idx] = 1.0
         else:
+            # Equal weight active assets
             mask = self.ACT[self.t] > 0
             if mask.any():
                 self.curr_w[mask] = 1.0 / mask.sum()
-        
+                
         self.wealth = 1.0
         self.peak_wealth = 1.0
         self.tail_buffer = []
@@ -494,336 +431,217 @@ class SharedDataEnv(gym.Env):
         
         info = {"date": pd.Timestamp(self.dates[self.t]).to_pydatetime()}
         return self._get_observation(), info
-    
+
     def step(self, action: np.ndarray):
         t = int(self.t)
+        terminated = False
+        truncated = False
         
-        if t >= self.T:
+        if t >= self.T or t >= self.ACT.shape[0]:
             return self._get_observation(), 0.0, True, False, {}
-        
+
         # Get current state
         act_mask = self.ACT[t]
         r_vec = self.R[t].copy()
         
-        # Only rebalance based on config interval
-        apply_action = (t % max(1, self.cfg.rebalance_interval) == 0)
+        # Only rebalance every rebalance_interval days
+        apply_action = (t % max(1, int(self.cfg.rebalance_interval)) == 0)
         w_prev = self.curr_w.copy()
         freed_mass = 0.0
         extra_delist_cost = 0.0
-        
+
         if apply_action:
-            # Convert discrete blocks to weights using config max_weight
-            blocks = np.asarray(action, dtype=np.float32)
-            w_tgt = fast_blocks_to_weights(blocks, act_mask, self.cfg.max_weight)
+            # DISCRETE ACTION HANDLING
+            blocks = np.asarray(action, dtype=int)
             
-            # Ensure normalization
+            # Apply activity mask to blocks
+            blocks = _sanitize_blocks_with_mask(blocks, act_mask)
+            
+            # Convert blocks to weights
+            w_tgt = _blocks_to_weights(blocks, self.cfg.weight_blocks)
+            
+            # Ensure max weight constraint is respected
+            # (blocks should already respect this, but double-check)
+            w_tgt = np.minimum(w_tgt, self.cfg.max_weight)
+            
+            # Renormalize if needed
             if w_tgt.sum() > 0:
                 w_tgt = w_tgt / w_tgt.sum()
             elif self.cash_idx is not None:
                 w_tgt = np.zeros_like(w_tgt)
                 w_tgt[self.cash_idx] = 1.0
         else:
-            # Hold but handle delistings based on config
+            # Hold position but handle delistings
             w_tgt = w_prev.copy()
             inactive = (act_mask <= 0)
             freed = float(np.maximum(w_tgt[inactive], 0.0).sum())
-            
             if freed > 0.0:
                 w_tgt[inactive] = 0.0
                 freed_mass = freed
                 extra_delist_cost = freed_mass * (self.cfg.delist_extra_bps / 10000.0)
                 
-                # Handle inactive based on config
+                # Send freed mass to cash or redistribute
                 if self.cfg.on_inactive == "to_cash" and self.cash_idx is not None:
                     w_tgt[self.cash_idx] += freed
-                else:  # pro_rata
+                else:
                     active = (act_mask > 0)
                     s = float(w_tgt[active].sum())
                     if s > 0.0:
                         w_tgt[active] += (w_tgt[active] / s) * freed
                     elif self.cash_idx is not None:
                         w_tgt[self.cash_idx] += freed
-                
+                        
+                # Renormalize
                 if w_tgt.sum() > 0:
                     w_tgt = w_tgt / w_tgt.sum()
-        
-        # Calculate costs using config parameters
-        turn = fast_turnover(w_tgt, w_prev)
+
+        # Calculate turnover and costs
+        turn = _turnover(w_tgt, w_prev)
         lin_cost = (self.cfg.transaction_cost_bps / 10000.0) * turn + extra_delist_cost
-        
+
         # Portfolio return
         rf_t = float(self.RF[t])
-        r_vec = np.where(np.isfinite(r_vec), r_vec, rf_t)
-        r_p = fast_portfolio_return(w_tgt, r_vec)
+        bad = ~np.isfinite(r_vec)
+        if bad.any():
+            r_vec[bad] = rf_t
+        r_p = float(np.dot(w_tgt, r_vec))
         
         # Benchmarks
         r_idx = float(self.IDX[t])
         alpha = r_p - r_idx
         excess = r_p - rf_t
-        
+
         # Update wealth
         net = max((1.0 + r_p) * (1.0 - max(lin_cost, 0.0)), 1e-12)
         r_net = net - 1.0
         self.wealth *= net
         self.peak_wealth = max(self.peak_wealth, self.wealth)
-        
-        # Drawdown penalty based on config mode
+
+        # Drawdown penalty
         cur_dd_level = 1.0 - (self.wealth / max(self.peak_wealth, 1e-12))
         if self.cfg.dd_mode == "level":
             dd_pen = -self.cfg.lambda_drawdown * abs(cur_dd_level)
-        else:  # incremental
-            prev_dd = self._history.get("drawdown", [0.0])[-1] if self._history.get("drawdown") else 0.0
-            dd_inc = max(cur_dd_level - prev_dd, 0.0)
+        else:
+            prev_dd_level = self._history.get("drawdown", [0.0])[-1] if self._history.get("drawdown") else 0.0
+            dd_inc = max(cur_dd_level - prev_dd_level, 0.0)
             dd_pen = -self.cfg.lambda_drawdown * dd_inc
-        
-        # Tail penalty based on config
+
+        # Tail penalty
         tail_pen = 0.0
-        if self.cfg.lambda_tail > 0:
-            self.tail_buffer.append(r_p)
-            if len(self.tail_buffer) > self.cfg.tail_window:
-                self.tail_buffer.pop(0)
-            if len(self.tail_buffer) >= max(10, self.cfg.tail_window // 2):
-                q = float(np.quantile(self.tail_buffer, self.cfg.tail_q))
-                if r_p < q:
-                    tail_pen = abs(r_p)
-        
-        # Calculate penalties using config lambdas
-        hhi_val = fast_hhi(w_tgt)
+        self.tail_buffer.append(r_p)
+        if len(self.tail_buffer) > self.cfg.tail_window:
+            self.tail_buffer.pop(0)
+        if self.cfg.lambda_tail > 0 and len(self.tail_buffer) >= max(10, self.cfg.tail_window // 2):
+            q = float(np.quantile(self.tail_buffer, self.cfg.tail_q))
+            if r_p < q:
+                tail_pen = abs(r_p)
+
+        # Other penalties
+        hhi_val = _hhi(w_tgt)
         pen = (
             - self.cfg.lambda_turnover * turn
             - self.cfg.lambda_hhi * hhi_val
             + dd_pen
             - self.cfg.lambda_tail * tail_pen
         )
-        
-        # Reward using config weights
-        reward = float(
-            self.cfg.weight_alpha * alpha + 
-            self.cfg.weight_excess * excess + 
-            pen - lin_cost
-        )
-        
+
+        # Reward
+        reward = float(self.cfg.weight_alpha * alpha + self.cfg.weight_excess * excess + pen - lin_cost)
+
         # Update state
         self.prev_w = w_prev
         self.curr_w = w_tgt
         self.t = t + 1
         
-        # Check termination based on config
-        terminated = (self.t >= self.T)
-        truncated = (self.cfg.max_steps is not None and self.t >= int(self.cfg.max_steps))
-        
+        if self.cfg.max_steps is not None and self.t >= int(self.cfg.max_steps):
+            truncated = True
+        if self.t >= self.T:
+            terminated = True
+
         obs = self._get_observation()
         info = {
             "date": pd.Timestamp(self.dates[min(self.t, self.T - 1)]).to_pydatetime(),
             "weights": self.curr_w.copy(),
+            "portfolio_return_gross": float(r_p),
             "portfolio_return": float(r_net),
+            "excess": float(excess),
+            "alpha": float(alpha),
+            "index_return": float(r_idx),
+            "rf": float(rf_t),
             "turnover": float(turn),
             "hhi": float(hhi_val),
+            "trade_cost": float(lin_cost),
             "wealth": float(self.wealth),
             "drawdown": float(cur_dd_level),
-            "rf": float(rf_t),
-            "index_return": float(r_idx),
-            "alpha": float(alpha),
-            "excess": float(excess),
+            "sector_exposure": _dict_sector_exposures(self.sector_ids, self.curr_w),
+            "config": asdict(self.cfg) if self.t == 1 else None,
         }
         
         # Store history
         for k, v in info.items():
-            if k not in ["weights", "date"]:
+            if k not in ["config", "sector_exposure", "weights", "date"]:
                 if k not in self._history:
                     self._history[k] = []
                 self._history[k].append(v)
-        
+                
         return obs, reward, terminated, truncated, info
-    
+
+    # ------------------------------- Helpers --------------------------------- #
+
+    def render(self):
+        t = min(self.t, self.T - 1)
+        date = pd.Timestamp(self.dates[t]).date()
+        wealth = self.wealth
+        dd = self._history["drawdown"][-1] if self._history.get("drawdown") else 0.0
+        print(f"[{date}] wealth={wealth:.4f} dd={dd:.3%}")
+
+    def get_history(self) -> pd.DataFrame:
+        """Return a DataFrame of per-step logged metrics."""
+        if not self._history:
+            return pd.DataFrame()
+        return pd.DataFrame(self._history, index=pd.to_datetime(
+            self.dates[:len(self._history.get('wealth', []))]
+        ))
+
+    def get_asset_ids(self) -> List[str]:
+        return list(self.asset_ids)
+
     def get_action_masks(self) -> np.ndarray:
-        """For MaskablePPO - based on config max_weight"""
+        """
+        For MaskablePPO: returns valid actions mask for MultiDiscrete space.
+        Since we're using independent blocks per asset, all actions are valid
+        (the environment handles inactive assets internally).
+        """
+        # For MultiDiscrete, return mask per asset's action dimension
+        # Each asset can take 0 to max_blocks_per_asset actions
         masks = []
         act_mask = self.ACT[self.t]
         
         for i in range(self.n_assets):
             asset_mask = np.ones(self.max_blocks_per_asset + 1, dtype=bool)
+            # If asset is inactive, only allow 0 blocks
             if act_mask[i] <= 0:
                 asset_mask[1:] = False
             masks.append(asset_mask)
-        
+            
         return masks
-    
-    def render(self):
-        t = min(self.t, self.T - 1)
-        date = pd.Timestamp(self.dates[t]).date()
-        print(f"[{date}] wealth={self.wealth:.4f} dd={self._history['drawdown'][-1]:.3%}")
 
-# -------------------------- Batched Environment -------------------------- #
+# ------------------------- Factory convenience ---------------------------- #
 
-class BatchedEnv(gym.Wrapper):
-    """
-    Batches multiple steps together for vectorized processing.
-    Batch size comes from config.
-    """
-    
-    def __init__(self, env: SharedDataEnv, batch_size: int = 16):
-        super().__init__(env)
-        self.batch_size = batch_size
-        self.action_buffer = []
-        self.obs_buffer = []
-        self.reward_buffer = []
-        self.info_buffer = []
-        
-    def step(self, action):
-        # Regular step
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        
-        # Store for potential batch processing
-        self.action_buffer.append(action)
-        self.obs_buffer.append(obs)
-        self.reward_buffer.append(reward)
-        self.info_buffer.append(info)
-        
-        # Clear buffers when batch is full or episode ends
-        if len(self.action_buffer) >= self.batch_size or terminated or truncated:
-            self._process_batch()
-        
-        return obs, reward, terminated, truncated, info
-    
-    def _process_batch(self):
-        """Process accumulated batch"""
-        if not self.action_buffer:
-            return
-        
-        # Here you could add batch processing logic
-        # For example, vectorized reward calculations across the batch
-        
-        # Clear buffers
-        self.action_buffer = []
-        self.obs_buffer = []
-        self.reward_buffer = []
-        self.info_buffer = []
-    
-    def reset(self, **kwargs):
-        self._process_batch()  # Clear any remaining buffer
-        return self.env.reset(**kwargs)
+def make_env_from_panel(panel: pd.DataFrame, **env_kwargs) -> DebentureTradingEnv:
+    """Factory: build DebentureTradingEnv from a panel and EnvConfig kwargs."""
+    cfg = EnvConfig(**env_kwargs)
+    return DebentureTradingEnv(panel=panel, config=cfg)
 
-# ------------------------- Factory Functions ----------------------------- #
-
-def make_env_from_config(panel: pd.DataFrame, config_path: str) -> SharedDataEnv:
-    """
-    Create environment directly from config file.
-    Preprocesses data once and creates SharedDataEnv.
-    """
-    # Load config from YAML
-    cfg = EnvConfig.from_yaml(config_path)
-    
-    # Preprocess data once
-    print("Preprocessing panel data from config...")
-    shared_data = SharedDataProcessor.process_panel(panel, cfg)
-    
-    # Set shared data
-    SharedDataEnv.set_shared_data(shared_data)
-    
-    # Create environment
-    return SharedDataEnv(cfg)
-
-def make_shared_env_from_panel(panel: pd.DataFrame, **env_kwargs) -> SharedDataEnv:
-    """
-    Factory to create SharedDataEnv with preprocessed data.
-    Parameters can come from kwargs or config file.
-    """
-    # If config_path is provided, load from file
-    if 'config_path' in env_kwargs:
-        cfg = EnvConfig.from_yaml(env_kwargs['config_path'])
-    else:
-        # Create from kwargs
-        cfg = EnvConfig(**env_kwargs)
-    
-    # Preprocess data once
-    print("Preprocessing panel data...")
-    shared_data = SharedDataProcessor.process_panel(panel, cfg)
-    
-    # Set shared data for all environments
-    SharedDataEnv.set_shared_data(shared_data)
-    
-    # Create environment
-    return SharedDataEnv(cfg)
-
-def make_env_from_panel(panel: pd.DataFrame, **env_kwargs) -> SharedDataEnv:
-    """
-    Backward compatible factory function.
-    Note: First call will preprocess data, subsequent calls will reuse it.
-    """
-    # If config_path is provided, use it
-    if 'config_path' in env_kwargs:
-        cfg = EnvConfig.from_yaml(env_kwargs['config_path'])
-    else:
-        cfg = EnvConfig(**env_kwargs)
-    
-    # Check if data is already shared
-    if SharedDataEnv._shared_data is None:
-        print("First environment creation - preprocessing data...")
-        shared_data = SharedDataProcessor.process_panel(panel, cfg)
-        SharedDataEnv.set_shared_data(shared_data)
-    
-    return SharedDataEnv(cfg)
-
-def make_batched_env_from_config(panel: pd.DataFrame, config_path: str, batch_size: Optional[int] = None) -> BatchedEnv:
-    """Create batched environment from config file"""
-    cfg = EnvConfig.from_yaml(config_path)
-    
-    # Use batch_size from config if not overridden
-    if batch_size is None:
-        # Look for batch_env_size in the config
-        with open(config_path, 'r') as f:
-            data = yaml.safe_load(f)
-            batch_size = data.get('batch_env_size', 16)
-    
-    base_env = make_env_from_config(panel, config_path)
-    return BatchedEnv(base_env, batch_size=batch_size)
-
-# ------------------------------ Quick Test -------------------------------- #
+# ------------------------------ Quick test -------------------------------- #
 
 if __name__ == "__main__":
-    print("Testing config-driven environment...")
-    
-    # Test loading from config file
-    test_config = """
-# Test config
-rebalance_interval: 5
-max_weight: 0.10
-weight_blocks: 100
-allow_cash: true
-cash_rate_as_rf: true
-on_inactive: to_cash
-transaction_cost_bps: 20.0
-delist_extra_bps: 20.0
-weight_excess: 0.0
-weight_alpha: 1.0
-lambda_turnover: 0.0002
-lambda_hhi: 0.01
-lambda_drawdown: 0.005
-lambda_tail: 0.0
-tail_window: 60
-tail_q: 0.05
-dd_mode: incremental
-include_prev_weights: true
-include_active_flag: true
-global_stats: true
-normalize_features: true
-obs_clip: 5.0
-max_steps: null
-random_reset_frac: 0.0
-seed: 42
-    """
-    
-    # Save test config
-    with open('test_config.yaml', 'w') as f:
-        f.write(test_config)
-    
-    # Create test data
+    # Test with discrete actions
     rng = np.random.default_rng(0)
-    dates = pd.date_range("2022-01-03", periods=100, freq="B")
-    ids = ["A", "B", "C"]
+    dates = pd.date_range("2022-01-03", periods=12, freq="B")
+    ids = ["A", "B"]
     idx = pd.MultiIndex.from_product([dates, ids], names=["date", "debenture_id"])
-    
+
     df = pd.DataFrame(index=idx)
     df["return"] = rng.normal(0.0003, 0.002, size=len(df)).astype(np.float32)
     df["risk_free"] = 0.0003
@@ -834,38 +652,30 @@ seed: 42
     df["sector_id"] = rng.integers(0, 3, size=len(df)).astype(np.int16)
     df["index_level"] = 1000.0
     df["active"] = 1
+    df["sector_spread"] = 0.03
+    df["sector_momentum"] = 0.0
+    df["sector_weight_index"] = 0.5
     
-    # Add required columns
-    for c in ["sector_spread", "sector_momentum", "sector_weight_index"]:
-        df[c] = 0.0
+    # Create lag columns
+    for c in ["return","spread","duration","time_to_maturity","risk_free","index_return",
+              "sector_spread","sector_momentum","sector_weight_index"]:
+        df[f"{c}_lag1"] = df[c]
+
+    # Test creating multiple environments
+    print("Creating multiple environments with shared data...")
+    envs = []
+    for i in range(4):
+        env = make_env_from_panel(df, rebalance_interval=5, max_weight=0.1, 
+                                 allow_cash=True, cash_rate_as_rf=True)
+        envs.append(env)
+        print(f"  Env {i} created - same data? {envs[0].R is env.R}")
     
-    # Test creating environment from config
-    print("\n1. Testing environment creation from config file...")
-    env = make_env_from_config(df, 'test_config.yaml')
-    print(f"   Environment created with config parameters")
-    print(f"   Max weight: {env.cfg.max_weight}")
-    print(f"   Rebalance interval: {env.cfg.rebalance_interval}")
-    print(f"   Transaction cost: {env.cfg.transaction_cost_bps} bps")
-    
-    # Test environment usage
-    print("\n2. Testing environment with config parameters...")
-    obs, info = env.reset()
-    for _ in range(10):
-        action = np.array([5, 3, 2, 0], dtype=int)  # 4 assets (3 + cash)
-        obs, reward, term, trunc, info = env.step(action)
+    # Run a few steps
+    obs, info = envs[0].reset()
+    for step in range(3):
+        action = np.array([5, 3, 2], dtype=int) if envs[0].n_assets == 3 else np.ones(envs[0].n_assets, dtype=int)
+        obs, r, term, trunc, info = envs[0].step(action)
         if term or trunc:
             break
     
-    print(f"   Final wealth: {info['wealth']:.6f}")
-    print(f"   Transaction costs applied: {env.cfg.transaction_cost_bps} bps")
-    
-    # Clean up test config
-    import os
-    os.remove('test_config.yaml')
-    
-    print("\n✓ Config-driven environment working correctly!")
-    
-    if HAS_NUMBA:
-        print("✓ JIT compilation active")
-    else:
-        print("⚠ Install numba for 2-5x speedup: pip install numba")
+    print("OK:", info["date"].date(), "wealth:", round(info["wealth"], 6))

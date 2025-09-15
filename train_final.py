@@ -56,7 +56,7 @@ except Exception as e:
 @dataclass
 class PPOConfig:
     policy: str = "MultiInputPolicy"
-    total_timesteps: int = 100_000
+    total_timesteps: int = 12_288
     learning_rate: float = 5e-6
     n_steps: int = 2048
     batch_size: int = 256
@@ -549,7 +549,7 @@ def main():
     
     ppo_cfg = PPOConfig(
         policy=config.get('policy', 'MultiInputPolicy'),
-        total_timesteps=config.get('total_timesteps', 10000),
+        total_timesteps=config.get('total_timesteps', 12_288),
         learning_rate=config.get('learning_rate', 5e-6),
         n_steps=config.get('n_steps', 512),  # Will be adjusted in train_one
         batch_size=config.get('batch_size', 64),
