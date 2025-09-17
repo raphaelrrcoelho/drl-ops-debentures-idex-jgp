@@ -23,6 +23,16 @@ try:
 except Exception as e:
     raise RuntimeError("sb3-contrib and stable-baselines3 are required.") from e
 
+import warnings
+warnings.filterwarnings("ignore", message=".*get_schedule_fn.*deprecated.*")
+warnings.filterwarnings("ignore", message=".*constant_fn.*deprecated.*")
+
+try:
+    import torch
+    import torch.nn as nn
+except Exception as e:
+    raise RuntimeError("PyTorch is required for evaluating. Please install torch.") from e
+
 # Our env
 from env_final import make_env_from_panel, EnvConfig
 
@@ -275,9 +285,12 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
             modified_cfg[param_name] = combo[j]
         
         # Create environment with modified config
-        env = make_env_from_panel(test_panel, **modified_cfg)
-        env = ActionMasker(env, mask_fn)
-        venv = DummyVecEnv([lambda: env])
+        def make_env():
+            env = make_env_from_panel(test_panel, **modified_cfg)
+            env = ActionMasker(env, mask_fn)
+            return env
+
+        venv = DummyVecEnv([make_env])
         
         # Load VecNormalize if available
         vecnorm_path = os.path.join(results_dir, "..", "models", strategy_label.split("_")[0].lower(), 
@@ -286,9 +299,10 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
             venv = VecNormalize.load(vecnorm_path, venv)
             venv.training = False
             venv.norm_reward = False
-        
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         # Load model
-        model = MaskablePPO.load(model_path, device="cpu")
+        model = MaskablePPO.load(model_path, device=device)
         
         # Run evaluation
         obs = venv.reset()
@@ -436,6 +450,13 @@ def main():
         env = make_env_from_panel(test_aug, **asdict(env_cfg))
         env = ActionMasker(env, mask_fn)
 
+        def make_env():
+            env = make_env_from_panel(test_aug, **asdict(env_cfg))
+            env = ActionMasker(env, mask_fn)
+            return env
+
+        venv = DummyVecEnv([make_env])
+
         # Date-level series for test
         test_dates = test_aug.index.get_level_values("date").unique().sort_values()
         idx_map = _date_level_map(test_aug, "index_return")
@@ -458,13 +479,13 @@ def main():
                 )
                 print(f"[SENSITIVITY] Completed analysis for {label}")
 
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             # Standard evaluation
-            model = MaskablePPO.load(model_path, device="cpu")
+            model = MaskablePPO.load(model_path, device=device)
 
             # Check for VecNormalize stats
             vecnorm_path = os.path.join(models_dir, f"vecnorm_fold_{fold}_seed_{seed}.pkl")
             if os.path.exists(vecnorm_path):
-                venv = DummyVecEnv([lambda: env])
                 venv = VecNormalize.load(vecnorm_path, venv)
                 venv.training = False
                 venv.norm_reward = False

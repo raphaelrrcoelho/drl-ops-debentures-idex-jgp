@@ -130,7 +130,7 @@ analysis:
   block_size: 21
   
   # Sensitivity analysis
-  run_sensitivity: false
+  run_sensitivity: true
   sensitivity_params: "lambda_turnover,lambda_hhi,lambda_drawdown,transaction_cost_bps"
   sensitivity_values: "0.5,1.0,2.0"  # Multiplicative factors
   
