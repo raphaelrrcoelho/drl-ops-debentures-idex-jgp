@@ -6,8 +6,8 @@
 policy: MultiInputPolicy
 total_timesteps: 12288  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
-n_steps: 4096  # 256 steps × 16 envs = 4096 total steps per rollout
-batch_size: 512  # Smaller batches for minibatch SGD (must divide n_steps)
+n_steps: 768        # 768 × 16 envs = 12,288 (exactly 1 rollout)
+batch_size: 256     # Must divide n_steps (768 / 256 = 3 minibatches)
 n_epochs: 5
 gamma: 0.99
 gae_lambda: 0.95

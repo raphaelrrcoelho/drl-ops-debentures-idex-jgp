@@ -146,12 +146,6 @@ def _normalize_columns(df: pd.DataFrame, universe: str) -> pd.DataFrame:
             df[c] = _safe_float(df[c]) / 100.0
 
     if "spread" in df.columns:
-        if universe.lower() == "infra":
-            # bps -> decimal
-            if df["spread"].dtype == object:
-                df["spread"] = df["spread"].astype(str).str.replace(",", ".", regex=False)
-            df["spread"] = _safe_float(df["spread"]) / 10000.0
-        else:
             # % -> decimal
             if df["spread"].dtype == object:
                 df["spread"] = df["spread"].astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False)
@@ -943,7 +937,7 @@ def prepare_data(data_dir: str = "data"):
     os.makedirs(data_dir, exist_ok=True)
     cdi = process_universe("cdi", data_dir)
     print("Data preparation complete.")
-    return cdi, infra
+    return cdi
 
 
 if __name__ == "__main__":
