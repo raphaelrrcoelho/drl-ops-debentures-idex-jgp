@@ -479,7 +479,7 @@ def main():
                 )
                 print(f"[SENSITIVITY] Completed analysis for {label}")
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
             # Standard evaluation
             model = MaskablePPO.load(model_path, device=device)
 

@@ -429,7 +429,7 @@ def train_one(
     # Create model
     set_global_seed(seed=seed)
     policy_kwargs = _policy_kwargs_from_cfg(adjusted_ppo_cfg)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
     
     already_trained = 0
     model = None

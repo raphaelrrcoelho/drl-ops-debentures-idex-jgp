@@ -4,9 +4,9 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 12288  # Increased to be meaningful (multiple of n_steps)
+total_timesteps: 40960  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
-n_steps: 768        # 768 × 16 envs = 12,288 (exactly 1 rollout)
+n_steps: 2560       # 2560 × 16 envs = 40,960 (exactly 10 rollout)
 batch_size: 256     # Must divide n_steps (768 / 256 = 3 minibatches)
 n_epochs: 5
 gamma: 0.99
@@ -46,13 +46,13 @@ global_stats: true
 
 # Reward configuration
 weight_excess: 0.0  # Weight for excess return (r - rf)
-weight_alpha: 1.0   # Weight for alpha (r - index)
+weight_alpha: 2.0   # Weight for alpha (r - index)
 
 # Reward penalties
 lambda_turnover: 0.0002
 lambda_hhi: 0.01
 lambda_drawdown: 0.005
-lambda_tail: 0.0  # Set to 0 to disable tail risk penalty
+lambda_tail: 0.001  # Set to 0 to disable tail risk penalty
 
 # Tail risk configuration (only used if lambda_tail > 0)
 tail_window: 60
