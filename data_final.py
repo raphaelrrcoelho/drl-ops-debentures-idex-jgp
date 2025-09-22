@@ -70,7 +70,7 @@ OPTIONAL_KEEP = [
     "sector_ns_beta0", "ns_beta1_common", "ns_lambda_common",
     "sector_fitted_spread", "spread_residual_ns",
     "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y",
-    # New enhanced features (will be added below)
+    # New features (will be added below)
     "ttm_rank", "excess_return", "sector_weight_index", "sector_spread_avg", 
     "sector_spread", "sector_momentum",
     # Momentum features
@@ -1007,7 +1007,7 @@ def _final_tidy_types(df: pd.DataFrame) -> pd.DataFrame:
 # ------------------------------- Public API ---------------------------------
 
 def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataFrame]:
-    """Main processing function with enhanced features."""
+    """Main processing function with features."""
     paths = UniversePaths(data_dir=data_dir, universe=universe.lower())
     raw = load_idex_folder(paths)
     if raw.empty:
@@ -1212,7 +1212,7 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
             "columns_required": REQUIRED_COLS,
             "columns_optional": [c for c in OPTIONAL_KEEP if c in final.columns],
             "total_features": feature_count,
-            "enhanced_features": {
+            "features": {
                 "momentum_windows": MOMENTUM_WINDOWS,
                 "volatility_windows": VOLATILITY_WINDOWS,
                 "feature_groups": [
@@ -1258,7 +1258,7 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
 
 
 def prepare_data(data_dir: str = "data"):
-    """Process CDI and Infrastructure universes with enhanced features."""
+    """Process CDI and Infrastructure universes with features."""
     os.makedirs(data_dir, exist_ok=True)
     
     print("\n" + "="*60)
@@ -1268,7 +1268,7 @@ def prepare_data(data_dir: str = "data"):
     cdi = process_universe("cdi", data_dir)
     
     if cdi is not None:
-        print(f"\n[SUCCESS] CDI universe processed with enhanced features")
+        print(f"\n[SUCCESS] CDI universe processed with features")
     
     print("\nData preparation complete.")
     return cdi

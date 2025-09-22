@@ -2,7 +2,7 @@
 """
 Debenture portfolio environment with DISCRETE action space and ENHANCED features
 ================================================================================
-Updated to use the comprehensive feature set from enhanced data_final.py including:
+Updated to use the comprehensive feature set from data_final.py including:
 - Momentum/reversal features at multiple horizons
 - Volatility features for returns and spreads
 - Relative value and sector-relative features
@@ -171,7 +171,7 @@ class DebentureTradingEnv(gym.Env):
         if self.cfg.seed is not None:
             np.random.seed(int(self.cfg.seed))
 
-        # Prepare arrays with enhanced features
+        # Prepare arrays with features
         self._prepare_data(panel)
 
         # Cash index (if any)
@@ -337,7 +337,7 @@ class DebentureTradingEnv(gym.Env):
                  .fillna(0.0)
         )
 
-        # Feature tensor (lagged) with enhanced features
+        # Feature tensor (lagged) with features
         feat_mats: List[np.ndarray] = []
         for c in feat_cols:
             wide = (
@@ -712,9 +712,9 @@ def make_env_from_panel(panel: pd.DataFrame, **env_kwargs) -> DebentureTradingEn
 # ------------------------------ Quick test -------------------------------- #
 
 if __name__ == "__main__":
-    # Test with enhanced features
+    # Test with features
     import sys
-    print("Testing enhanced env_final.py with comprehensive features...")
+    print("Testing env_final.py with comprehensive features...")
     
     # Check if we have processed data
     data_path = "data/cdi_processed.pkl"
@@ -746,7 +746,7 @@ if __name__ == "__main__":
         test_panel["active"] = 1
         test_panel["index_weight"] = rng.uniform(0.01, 0.1, size=len(test_panel)).astype(np.float32)
         
-        # Add synthetic enhanced features (with lag1 versions)
+        # Add synthetic features (with lag1 versions)
         for feat in ["momentum_5d", "volatility_20d", "spread_vs_sector_median", 
                     "duration_change", "liquidity_score", "carry_spread_ratio",
                     "spread_momentum_5d", "sharpe_20d"]:
