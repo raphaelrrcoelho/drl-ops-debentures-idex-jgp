@@ -4,10 +4,10 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 40960  # Increased to be meaningful (multiple of n_steps)
+total_timesteps: 20_480  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
-n_steps: 2560       # 2560 × 16 envs = 40,960 (exactly 10 rollout)
-batch_size: 256     # Must divide n_steps (768 / 256 = 3 minibatches)
+n_steps: 1280       # 1_280 × 16 envs = 20_480 (exactly 10 rollout)
+batch_size: 256     # Must divide n_steps (1280 / 256 = 5 minibatches)
 n_epochs: 5
 gamma: 0.99
 gae_lambda: 0.95
