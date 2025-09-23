@@ -406,28 +406,6 @@ class DebentureTradingEnv(gym.Env):
             self.asset_ids.append("__CASH__")
             self.n_assets += 1
 
-        # Log feature info
-        print(f"[ENV] Initialized with {self.F} features per asset:")
-        print(f"      Base features: {len(BASE_FEATURES)}")
-        if self.cfg.use_momentum_features:
-            print(f"      Momentum/Reversal: {len(MOMENTUM_FEATURES) + len(REVERSAL_FEATURES)}")
-        if self.cfg.use_volatility_features:
-            print(f"      Volatility: {len(VOLATILITY_FEATURES) + len(SPREAD_VOL_FEATURES)}")
-        if self.cfg.use_relative_value_features:
-            print(f"      Relative Value: {len(RELATIVE_VALUE_FEATURES)}")
-        if self.cfg.use_duration_features:
-            print(f"      Duration Risk: {len(DURATION_FEATURES)}")
-        if self.cfg.use_microstructure_features:
-            print(f"      Microstructure: {len(MICROSTRUCTURE_FEATURES)}")
-        if self.cfg.use_carry_features:
-            print(f"      Carry: {len(CARRY_FEATURES)}")
-        if self.cfg.use_spread_dynamics:
-            print(f"      Spread Dynamics: {len(SPREAD_DYNAMICS_FEATURES)}")
-        if self.cfg.use_risk_adjusted_features:
-            print(f"      Risk-Adjusted: {len(RISK_ADJUSTED_FEATURES)}")
-        if self.cfg.use_sector_curves:
-            print(f"      Sector Curves: {len(SECTOR_CURVE_FEATURES)}")
-
     # --------------------------- Observation builder ------------------------ #
 
     def _obs_size(self) -> int:

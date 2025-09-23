@@ -76,8 +76,6 @@ class PPOConfig:
     ortho_init: bool = True
     activation: str = "relu"       # ReLU often better for many features
     normalize_advantage: bool = True
-    use_sde: bool = False          # State-dependent exploration
-    sde_sample_freq: int = -1
 
 @dataclass
 class EnvConfig(EnvConfig):
@@ -500,7 +498,7 @@ def _quick_evaluate_config(
         max_grad_norm=ppo_cfg.max_grad_norm,
         policy_kwargs=policy_kwargs,
         verbose=0,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cpu",
         seed=seed,
     )
     
@@ -643,7 +641,7 @@ def train_one(
     # Create model with adaptive architecture
     set_global_seed(seed=seed)
     policy_kwargs = _policy_kwargs_from_cfg(ppo_cfg, n_features, n_assets)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     
     print(f"  Network architecture: {policy_kwargs['net_arch']}")
     print(f"  Device: {device}")
@@ -683,8 +681,6 @@ def train_one(
             verbose=1 if seed == 0 else 0,  # Verbose for first seed only
             device=device,
             seed=seed,
-            use_sde=ppo_cfg.use_sde,
-            sde_sample_freq=ppo_cfg.sde_sample_freq,
         )
 
     # Train
@@ -808,8 +804,6 @@ def main():
         activation=config.get('activation', 'relu'),
         ortho_init=bool(config.get('ortho_init', True)),
         normalize_advantage=bool(config.get('normalize_advantage', True)),
-        use_sde=bool(config.get('use_sde', False)),
-        sde_sample_freq=config.get('sde_sample_freq', -1),
     )
 
     #environment config
