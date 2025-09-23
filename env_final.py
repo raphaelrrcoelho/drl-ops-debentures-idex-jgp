@@ -29,7 +29,7 @@ from gymnasium import spaces
 @dataclass
 class EnvConfig:
     # Rebalance & constraints
-    rebalance_interval: int = 5
+    rebalance_interval: int = 10
     max_weight: float = 0.10
     weight_blocks: int = 100
     allow_cash: bool = True
@@ -37,7 +37,6 @@ class EnvConfig:
     on_inactive: str = "to_cash"
 
     # Costs & penalties
-    weight_excess: float = 0.0   
     weight_alpha: float = 1.0   
     transaction_cost_bps: float = 20.0          
     delist_extra_bps: float = 20.0              
@@ -77,15 +76,15 @@ class EnvConfig:
 # -------------------------- Enhanced Features List ----------------------- #
 
 # Define comprehensive feature groups
-MOMENTUM_WINDOWS = [1, 5, 20, 60, 126]
-VOLATILITY_WINDOWS = [5, 20, 60]
+MOMENTUM_WINDOWS = [5, 20]
+VOLATILITY_WINDOWS = [5, 20]
 
 # Base features (will use lagged versions)
 BASE_FEATURES = [
     "return", "spread", "duration", "time_to_maturity",
     "risk_free", "index_return", "ttm_rank",
     "sector_weight_index", "sector_spread", "sector_momentum",
-    "index_weight", "sector_id",
+    "sector_id",
 ]
 
 # Enhanced feature groups
@@ -101,7 +100,7 @@ RELATIVE_VALUE_FEATURES = [
 
 DURATION_FEATURES = [
     "duration_change", "duration_vol", "duration_spread_interaction",
-    "modified_duration_proxy", "convexity_proxy",
+    # "modified_duration_proxy", "convexity_proxy",
 ]
 
 MICROSTRUCTURE_FEATURES = [
@@ -118,14 +117,14 @@ SPREAD_DYNAMICS_FEATURES = [
 ]
 
 RISK_ADJUSTED_FEATURES = [
-    "sharpe_5d", "sharpe_20d", "sharpe_60d",
-    "information_ratio_20d",
+    # "sharpe_5d", "sharpe_20d", "sharpe_60d",
+    # "information_ratio_20d",
 ]
 
 SECTOR_CURVE_FEATURES = [
     "sector_ns_beta0", "ns_beta1_common", "ns_lambda_common",
     "sector_fitted_spread", "spread_residual_ns",
-    "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y",
+    # "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y",
 ]
 
 # ------------------------------ Utilities -------------------------------- #
@@ -406,6 +405,28 @@ class DebentureTradingEnv(gym.Env):
             self.asset_ids.append("__CASH__")
             self.n_assets += 1
 
+        # Log feature info
+        # print(f"[ENV] Initialized with {self.F} features per asset:")
+        # print(f"      Base features: {len(BASE_FEATURES)}")
+        # if self.cfg.use_momentum_features:
+        #     print(f"      Momentum/Reversal: {len(MOMENTUM_FEATURES) + len(REVERSAL_FEATURES)}")
+        # if self.cfg.use_volatility_features:
+        #     print(f"      Volatility: {len(VOLATILITY_FEATURES) + len(SPREAD_VOL_FEATURES)}")
+        # if self.cfg.use_relative_value_features:
+        #     print(f"      Relative Value: {len(RELATIVE_VALUE_FEATURES)}")
+        # if self.cfg.use_duration_features:
+        #     print(f"      Duration Risk: {len(DURATION_FEATURES)}")
+        # if self.cfg.use_microstructure_features:
+        #     print(f"      Microstructure: {len(MICROSTRUCTURE_FEATURES)}")
+        # if self.cfg.use_carry_features:
+        #     print(f"      Carry: {len(CARRY_FEATURES)}")
+        # if self.cfg.use_spread_dynamics:
+        #     print(f"      Spread Dynamics: {len(SPREAD_DYNAMICS_FEATURES)}")
+        # if self.cfg.use_risk_adjusted_features:
+        #     print(f"      Risk-Adjusted: {len(RISK_ADJUSTED_FEATURES)}")
+        # if self.cfg.use_sector_curves:
+        #     print(f"      Sector Curves: {len(SECTOR_CURVE_FEATURES)}")
+
     # --------------------------- Observation builder ------------------------ #
 
     def _obs_size(self) -> int:
@@ -601,7 +622,7 @@ class DebentureTradingEnv(gym.Env):
         )
 
         # Reward
-        reward = float(self.cfg.weight_alpha * alpha + self.cfg.weight_excess * excess + pen - lin_cost)
+        reward = float(self.cfg.weight_alpha * alpha + pen - lin_cost)
 
         # Update state
         self.prev_w = w_prev
@@ -722,7 +743,6 @@ if __name__ == "__main__":
         test_panel["sector_id"] = rng.integers(0, 3, size=len(test_panel)).astype(np.int16)
         test_panel["index_level"] = 1000.0
         test_panel["active"] = 1
-        test_panel["index_weight"] = rng.uniform(0.01, 0.1, size=len(test_panel)).astype(np.float32)
         
         # Add synthetic features (with lag1 versions)
         for feat in ["momentum_5d", "volatility_20d", "spread_vs_sector_median", 
@@ -733,13 +753,13 @@ if __name__ == "__main__":
         
         # Add other required lag columns
         for c in ["return", "spread", "duration", "time_to_maturity", "risk_free", 
-                 "index_return", "index_weight"]:
+                 "index_return"]:
             test_panel[f"{c}_lag1"] = test_panel[c]
 
     # Create environment with full feature set
     env = make_env_from_panel(
         test_panel, 
-        rebalance_interval=5, 
+        rebalance_interval=10, 
         max_weight=0.1, 
         allow_cash=True, 
         cash_rate_as_rf=True,
