@@ -300,7 +300,7 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
             venv.training = False
             venv.norm_reward = False
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"
         # Load model
         model = MaskablePPO.load(model_path, device=device)
         
@@ -479,7 +479,7 @@ def main():
                 )
                 print(f"[SENSITIVITY] Completed analysis for {label}")
 
-            device = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
+            device = "cpu"
             # Standard evaluation
             model = MaskablePPO.load(model_path, device=device)
 
