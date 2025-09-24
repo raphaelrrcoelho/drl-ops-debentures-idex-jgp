@@ -4,10 +4,10 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 20_480  # Increased to be meaningful (multiple of n_steps)
+total_timesteps: 40960  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
-n_steps: 1280       # 1_280 × 16 envs = 20_480 (exactly 10 rollout)
-batch_size: 256     # Must divide n_steps (1280 / 256 = 5 minibatches)
+n_steps: 2560       
+batch_size: 256
 n_epochs: 5
 gamma: 0.99
 gae_lambda: 0.95
@@ -45,8 +45,7 @@ include_active_flag: false
 global_stats: true
 
 # Reward configuration
-weight_excess: 0.0  # Weight for excess return (r - rf)
-weight_alpha: 2.0   # Weight for alpha (r - index)
+weight_alpha: 1.0   # Weight for alpha (r - index)
 
 # Reward penalties
 lambda_turnover: 0.0002
@@ -62,6 +61,7 @@ dd_mode: incremental  # or "level"
 # Episode control
 max_steps: 256  # Episode length matches steps per env per rollout
 random_reset_frac: 0.9  # For training data augmentation
+max_assets: 50  # Use only top 50 assets by weight each day
 
 # ========================
 # Validation Configuration
@@ -83,7 +83,7 @@ lambda_grid: null  # Disabled for faster training
 # Walk-forward configuration
 n_folds: 9
 embargo_days: 3
-seeds: "0,1,2"  # Comma-separated string
+seeds: "0,1,2,4"  # Comma-separated string
 
 # Checkpoint and logging
 checkpoint_freq: 50000
@@ -91,7 +91,7 @@ tensorboard_log: true
 verbose: 0  # 0=silent, 1=info, 2=debug
 
 # Parallel training
-n_envs: 4  # Number of parallel environments per training
+n_envs: 16  # Number of parallel environments per training
 n_jobs: 1  # Number of parallel fold/seed combinations
 
 # Training options
