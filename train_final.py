@@ -458,46 +458,6 @@ class DetailedMetricsLoggerCallback(BaseCallback):
             self.recent_rewards.append(ep_reward)
             self.recent_lengths.append(ep_length)
         
-        # Periodic detailed logging
-        if self.num_timesteps > 0 and self.num_timesteps % 5000 == 0:
-            elapsed = time.time() - self.start_time
-            since_last = time.time() - self.last_log_time
-            steps_per_sec = 5000 / since_last if since_last > 0 else 0
-            
-            print(f"\n[PROGRESS - Step {self.num_timesteps:,}]")
-            print(f"  Episodes completed: {self.episode_count}")
-            print(f"  Steps/second: {steps_per_sec:.1f}")
-            print(f"  Time elapsed: {elapsed/60:.1f} min")
-            print(f"  Memory: {log_memory_usage_mb():.1f} MB")
-            
-            if self.recent_rewards:
-                # Efficient numpy operations
-                rewards_array = np.array(self.recent_rewards)
-                lengths_array = np.array(self.recent_lengths)
-                print(f"  Recent performance (last {len(rewards_array)} episodes):")
-                print(f"    Mean reward: {rewards_array.mean():.4f}")
-                print(f"    Std reward: {rewards_array.std():.4f}")
-                print(f"    Max reward: {rewards_array.max():.4f}")
-                print(f"    Min reward: {rewards_array.min():.4f}")
-                print(f"    Mean length: {lengths_array.mean():.1f}")
-            
-            # Learning statistics from logger
-            if hasattr(self.model, "logger") and self.model.logger:
-                if hasattr(self.model.logger, "name_to_value"):
-                    stats = self.model.logger.name_to_value
-                    important_stats = [
-                        ("train/learning_rate", "Learning rate", ".2e"),
-                        ("train/loss", "Loss", ".4f"),
-                        ("train/explained_variance", "Explained variance", ".3f"),
-                        ("train/clip_fraction", "Clip fraction", ".3f"),
-                        ("train/approx_kl", "Approx KL", ".4f"),
-                    ]
-                    for key, name, fmt in important_stats:
-                        if key in stats:
-                            print(f"  {name}: {stats[key]:{fmt}}")
-            
-            self.last_log_time = time.time()
-        
         return True
 
     def _on_training_end(self) -> None:

@@ -1,6 +1,7 @@
 # evaluate_final.py
 """
 Evaluate MaskablePPO with discrete actions on fold-specific asset universes
+Adapted for enhanced features from data_final.py and optimized environment
 Includes sensitivity analysis for transaction costs and reward parameters
 """
 from __future__ import annotations
@@ -81,6 +82,34 @@ REQUIRED_COLS = [
     "risk_free", "index_return", "time_to_maturity", "index_level",
 ]
 
+# Enhanced features that should be preserved
+ENHANCED_FEATURE_GROUPS = {
+    "momentum": ["momentum_5d", "momentum_20d", "momentum_60d", "momentum_126d"],
+    "reversal": ["reversal_5d", "reversal_20d", "reversal_60d", "reversal_126d"],
+    "volatility": ["volatility_5d", "volatility_20d", "volatility_60d"],
+    "spread_vol": ["spread_vol_5d", "spread_vol_20d", "spread_vol_60d"],
+    "relative_value": [
+        "spread_vs_sector_median", "spread_vs_sector_mean",
+        "spread_percentile_sector", "spread_percentile_all"
+    ],
+    "duration_risk": [
+        "duration_change", "duration_vol", "duration_spread_interaction",
+        "modified_duration_proxy", "convexity_proxy"
+    ],
+    "microstructure": ["liquidity_score", "weight_momentum", "weight_volatility"],
+    "carry": ["carry_spread_ratio", "carry_momentum", "carry_vol"],
+    "spread_dynamics": [
+        "spread_momentum_5d", "spread_momentum_20d",
+        "spread_mean_reversion", "spread_acceleration"
+    ],
+    "risk_adjusted": ["sharpe_5d", "sharpe_20d", "sharpe_60d", "information_ratio_20d"],
+    "sector_curves": [
+        "sector_ns_beta0", "ns_beta1_common", "ns_lambda_common",
+        "sector_fitted_spread", "spread_residual_ns",
+        "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y"
+    ]
+}
+
 SAFE_FILL_0 = ["return", "spread", "duration", "time_to_maturity", "ttm_rank"]
 DATE_LEVEL = ["risk_free", "index_return", "index_level"]
 
@@ -112,10 +141,10 @@ def compute_union_ids_from_panel(panel: pd.DataFrame, fold_cfg: Dict[str, str]) 
     return sl.index.get_level_values("debenture_id").unique().astype(str).tolist()
 
 def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str], 
-                                union_ids: List[str]) -> pd.DataFrame:
+                                union_ids: List[str], feature_config: Dict) -> pd.DataFrame:
     """
     TEST dates × UNION IDS; missing pairs => ACTIVE=0 and safe feature fills.
-    Mirrors the baselines' dynamic universe preparation.
+    Enhanced to include all features from data_final.py based on config.
     """
     test_start = pd.to_datetime(fold_cfg["test_start"])
     test_end = pd.to_datetime(fold_cfg["test_end"])
@@ -129,6 +158,48 @@ def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str],
     for c in REQUIRED_COLS:
         if c not in test_aug.columns:
             test_aug[c] = np.nan
+
+    # Add enhanced features based on config
+    all_enhanced_features = []
+    feature_flags = {
+        "use_momentum_features": feature_config.get('use_momentum_features', True),
+        "use_volatility_features": feature_config.get('use_volatility_features', True),
+        "use_relative_value_features": feature_config.get('use_relative_value_features', True),
+        "use_duration_features": feature_config.get('use_duration_features', True),
+        "use_microstructure_features": feature_config.get('use_microstructure_features', True),
+        "use_carry_features": feature_config.get('use_carry_features', True),
+        "use_spread_dynamics": feature_config.get('use_spread_dynamics', True),
+        "use_risk_adjusted_features": feature_config.get('use_risk_adjusted_features', True),
+        "use_sector_curves": feature_config.get('use_sector_curves', True),
+        "use_zscore_features": feature_config.get('use_zscore_features', True),
+        "use_rolling_zscores": feature_config.get('use_rolling_zscores', True),
+    }
+
+    # Collect features based on config flags
+    for group_name, features in ENHANCED_FEATURE_GROUPS.items():
+        flag_name = f"use_{group_name.split('_')[0]}_features"  # e.g., "use_momentum_features"
+        if feature_flags.get(flag_name, True):
+            all_enhanced_features.extend(features)
+
+    # Add z-score features if enabled
+    if feature_flags.get('use_zscore_features', True):
+        z_features = [f"{feat}_z" for feat in all_enhanced_features if feat in panel.columns]
+        all_enhanced_features.extend(z_features)
+
+    # Add rolling z-score features if enabled
+    if feature_flags.get('use_rolling_zscores', True):
+        rolling_z_features = []
+        for feat in all_enhanced_features:
+            if feat in panel.columns:
+                rolling_z_features.extend([f"{feat}_z252", f"{feat}_z126", f"{feat}_z63"])
+        all_enhanced_features.extend(rolling_z_features)
+
+    # Ensure all enhanced features exist in the panel
+    for feat in all_enhanced_features:
+        if feat not in test_aug.columns and feat in panel.columns:
+            # Copy the feature from original panel if available
+            feat_series = panel[feat].reindex(test_aug.index)
+            test_aug[feat] = feat_series
 
     # Broadcast date-level fields
     for name in DATE_LEVEL:
@@ -154,6 +225,14 @@ def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str],
     if "index_level" in test_aug.columns:
         test_aug["index_level"] = test_aug["index_level"].astype(float).ffill().fillna(0.0)
 
+    # Fill enhanced features with 0 if missing
+    for feat in all_enhanced_features:
+        if feat in test_aug.columns:
+            test_aug[feat] = test_aug[feat].fillna(0.0).astype(np.float32)
+
+    print(f"[EVAL] Enhanced features enabled: {len(all_enhanced_features)}")
+    print(f"[EVAL] Feature groups: {[k for k, v in feature_flags.items() if v]}")
+    
     return test_aug
 
 # ------------------------------ Metrics ---------------------------------- #
@@ -370,7 +449,16 @@ def main():
                    help="Comma-separated list of parameters to vary in sensitivity analysis")
     ap.add_argument("--sensitivity_values", type=str, default="0.5,1.0,2.0",
                    help="Comma-separated list of multiplicative factors to apply to parameters")
+    ap.add_argument("--config", type=str, default="config.yaml", help="Configuration file path")
     args = ap.parse_args()
+
+    # Load config file for feature flags and parameters
+    config = {}
+    if os.path.exists(args.config):
+        import yaml
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+        print(f"[CONFIG] Loaded configuration from {args.config}")
 
     res_dir = os.path.join(args.out_base, "results", args.universe)
     models_dir = os.path.join(args.out_base, "models", args.universe, "ppo")
@@ -394,18 +482,54 @@ def main():
 
     folds = read_json(folds_path)
     train_cfg = read_json(cfg_path)
-    env_cfg = EnvConfig(**train_cfg.get("env_config", {}))
+    
+    # Priority: command line args > config file > training config
+    env_cfg_dict = train_cfg.get("env_config", {})
+    
+    # Override with config file parameters if available
+    if config:
+        # Environment config from config file takes priority
+        env_cfg_dict.update({
+            k: config[k] for k in [
+                'rebalance_interval', 'max_weight', 'weight_blocks', 'allow_cash', 
+                'cash_rate_as_rf', 'on_inactive', 'transaction_cost_bps', 
+                'delist_extra_bps', 'normalize_features', 'obs_clip', 
+                'include_prev_weights', 'include_active_flag', 'global_stats',
+                'weight_alpha', 'lambda_turnover', 'lambda_hhi', 'lambda_drawdown',
+                'lambda_tail', 'tail_window', 'tail_q', 'dd_mode', 'max_steps',
+                'random_reset_frac', 'max_assets'
+            ] if k in config
+        })
+        
+        # Enhanced feature flags from config file
+        feature_flags = {
+            k: config.get(k, True) for k in [
+                'use_momentum_features', 'use_volatility_features', 
+                'use_relative_value_features', 'use_duration_features',
+                'use_microstructure_features', 'use_carry_features',
+                'use_spread_dynamics', 'use_risk_adjusted_features',
+                'use_sector_curves', 'use_zscore_features', 'use_rolling_zscores'
+            ]
+        }
+        env_cfg_dict.update(feature_flags)
+    
+    env_cfg = EnvConfig(**env_cfg_dict)
 
     # Strategy label
     base_label = "PPO"
 
-    # Seeds
+    # Seeds - priority: command line > config file > training config
     if args.seeds.strip():
         seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     else:
-        # default to training seeds if available; otherwise [0]
-        sconf = str(train_cfg.get("seeds", "0"))
-        seeds = [int(s) for s in sconf.split(",") if s.strip()]
+        # Try config file
+        config_seeds = config.get('seeds', '') if config else ''
+        if config_seeds:
+            seeds = [int(s) for s in config_seeds.split(",") if s.strip()]
+        else:
+            # Fallback to training config
+            sconf = str(train_cfg.get("seeds", "0"))
+            seeds = [int(s) for s in sconf.split(",") if s.strip()]
 
     # Fold subset
     if args.folds.strip():
@@ -419,11 +543,21 @@ def main():
     rf_df = pd.read_csv(rf_path, parse_dates=["date"]).set_index("date")
     rf_series = rf_df["risk_free"].astype(float)
 
-    # Sensitivity analysis setup
-    if args.sensitivity:
-        sensitivity_params = [p.strip() for p in args.sensitivity_params.split(",") if p.strip()]
-        sensitivity_factors = [float(v.strip()) for v in args.sensitivity_values.split(",") if v.strip()]
+    # Sensitivity analysis setup - priority: command line > config file
+    sensitivity_params = [p.strip() for p in args.sensitivity_params.split(",") if p.strip()]
+    sensitivity_factors = [float(v.strip()) for v in args.sensitivity_values.split(",") if v.strip()]
+    
+    # Override with config file if available
+    if config:
+        config_sensitivity_params = config.get('sensitivity_params', '')
+        config_sensitivity_values = config.get('sensitivity_values', '')
         
+        if config_sensitivity_params:
+            sensitivity_params = [p.strip() for p in config_sensitivity_params.split(",") if p.strip()]
+        if config_sensitivity_values:
+            sensitivity_factors = [float(v.strip()) for v in config_sensitivity_values.split(",") if v.strip()]
+    
+    if args.sensitivity:
         # Create parameter variations
         param_variations = {}
         for param in sensitivity_params:
@@ -432,6 +566,21 @@ def main():
                 param_variations[param] = [base_value * factor for factor in sensitivity_factors]
             else:
                 print(f"[WARN] Parameter {param} not found in env config, skipping")
+
+    # Evaluation configuration from config file
+    eval_config = config.get('evaluation', {}) if config else {}
+    deterministic = eval_config.get('deterministic', True)
+    save_weights = eval_config.get('save_weights', True)
+    save_topk = eval_config.get('save_topk', True)
+    topk_k = eval_config.get('topk_k', 5)
+    
+    # Override with command line args if provided
+    if args.deterministic is not None:
+        deterministic = args.deterministic
+    if args.save_topk is not None:
+        save_topk = args.save_topk
+    if args.topk_k is not None:
+        topk_k = args.topk_k
 
     # Iterate folds
     for fcfg in folds:
@@ -443,10 +592,10 @@ def main():
             print(f"[INFO] Computing union IDs for fold {fold}")
             union = compute_union_ids_from_panel(panel, fcfg)
 
-        # Build TEST panel (dates × union_ids)
-        test_aug = build_eval_panel_with_union(panel, fcfg, union)
+        # Build TEST panel with enhanced features based on config
+        test_aug = build_eval_panel_with_union(panel, fcfg, union, env_cfg_dict)
 
-        # Build env with SAME config used during training
+        # Build env with SAME config used during training (with config file overrides)
         env = make_env_from_panel(test_aug, **asdict(env_cfg))
         env = ActionMasker(env, mask_fn)
 
@@ -479,7 +628,7 @@ def main():
                 )
                 print(f"[SENSITIVITY] Completed analysis for {label}")
 
-            device = "cpu" #"cuda" if torch.cuda.is_available() else "cpu"
+            device = "cpu"  # Use CPU for evaluation to avoid GPU memory issues
             # Standard evaluation
             model = MaskablePPO.load(model_path, device=device)
 
@@ -507,7 +656,7 @@ def main():
 
             t = 0
             while not done and t < len(test_dates):
-                action, _ = model.predict(obs, deterministic=args.deterministic)
+                action, _ = model.predict(obs, deterministic=deterministic)
                 
                 if hasattr(env, 'num_envs'):  # VecEnv
                     obs, rewards, dones, infos = env.step(action)
@@ -541,7 +690,7 @@ def main():
 
                 # weights snapshot (vector aligned to asset_ids)
                 w = info.get("weights", None)
-                if w is not None:
+                if w is not None and save_weights:
                     w = np.asarray(w, dtype=float).ravel()
                     if w.size == len(asset_ids):
                         weights_by_date.append((dt, w))
@@ -553,7 +702,7 @@ def main():
             append_long_csv(os.path.join(res_dir, "all_diagnostics.csv"), df_diag, sort_by=["date", "strategy", "metric"])
 
             # --- Save pickle with timeseries + wide weights ---
-            if weights_by_date:
+            if weights_by_date and save_weights:
                 dates_w = [d for d, _ in weights_by_date]
                 mat = np.vstack([w for _, w in weights_by_date])
                 df_wide = pd.DataFrame(mat, index=pd.to_datetime(dates_w), columns=[str(x) for x in asset_ids]).sort_index()
@@ -565,15 +714,16 @@ def main():
                 "diagnostics": df_diag,
                 "weights": df_wide,
                 "asset_ids": [str(x) for x in asset_ids],
+                "feature_config": env_cfg_dict,  # Save feature configuration
             }
             pkl_path = os.path.join(res_dir, f"fold_{fold}_seed_{seed}_results.pkl")
             pd.to_pickle(out_pkl, pkl_path)
 
             # --- Append weights_long.csv and optional top-k snapshots ---
-            if not df_wide.empty:
+            if not df_wide.empty and save_weights:
                 append_weights_long(res_dir, df_wide, label, fold, seed)
-                if args.save_topk:
-                    write_topk_holdings_snapshot(res_dir, df_wide, label, fold, seed, k=args.topk_k)
+                if save_topk:
+                    write_topk_holdings_snapshot(res_dir, df_wide, label, fold, seed, k=topk_k)
 
             # --- Per-run metrics (consistent with baselines) ---
             r_series = df_ret.set_index("date")["return"].astype(float)
