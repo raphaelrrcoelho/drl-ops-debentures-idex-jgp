@@ -211,15 +211,18 @@ def _dict_sector_exposures(sector_ids: np.ndarray, weights: np.ndarray) -> Dict[
 class DebentureTradingEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, panel: pd.DataFrame, config: EnvConfig):
+    def __init__(self, panel: pd.DataFrame, config: EnvConfig, prebuilt: dict | None = None):
         super().__init__()
         assert isinstance(panel.index, pd.MultiIndex), "panel must be MultiIndex (date, debenture_id)"
         self.cfg = config
         if self.cfg.seed is not None:
             np.random.seed(int(self.cfg.seed))
 
-        # Prepare arrays with features
-        self._prepare_data(panel)
+        # NEW: attach prebuilt arrays if provided, otherwise build once
+        if prebuilt is not None:
+            self._attach_prebuilt(prebuilt)
+        else:
+            self._prepare_data(panel)   # existing path  ← keeps your current behavior  :contentReference[oaicite:0]{index=0}
 
         # Cash index (if any)
         self.cash_idx = None
@@ -254,6 +257,55 @@ class DebentureTradingEnv(gym.Env):
 
         # Logs
         self._history: Dict[str, list] = {}
+
+    def export_shared_arrays(self) -> dict:
+        """Return views to big, read-only arrays and metadata so other envs can reuse them."""
+        return {
+            "R": self.R,                # (T, N)
+            "X": self.X,                # (T, N, F)
+            "ACT": self.ACT,            # (T, N)
+            "RF": self.RF,              # (T,)
+            "IDX": self.IDX,            # (T,)
+            "RF_obs": self.RF_obs,      # (T,)
+            "IDX_obs": self.IDX_obs,    # (T,)
+            "global_means": getattr(self, "global_means", None),
+            "global_stds": getattr(self, "global_stds", None),
+            "dates": self.dates,        # (T,)
+            "asset_ids": self.asset_ids,
+            "feature_cols": self.feature_cols,
+            "n_assets": self.n_assets,
+            "F": self.F,
+            "T": self.T,
+            "sector_ids": getattr(self, "sector_ids", None),
+        }
+
+    def _attach_prebuilt(self, pb: dict) -> None:
+        """Wire prebuilt arrays/metadata into this env (no copies)."""
+        # Big arrays (keep references; do NOT copy)
+        self.R = pb["R"]
+        self.X = pb["X"]
+        self.ACT = pb["ACT"]
+        self.RF = pb["RF"]
+        self.IDX = pb["IDX"]
+        self.RF_obs = pb["RF_obs"]
+        self.IDX_obs = pb["IDX_obs"]
+        self.global_means = pb.get("global_means", None)
+        self.global_stds = pb.get("global_stds", None)
+
+        # Metadata
+        self.dates = pb["dates"]
+        self.asset_ids = list(pb["asset_ids"])
+        self.feature_cols = list(pb["feature_cols"])
+        self.n_assets = int(pb["n_assets"])
+        self.F = int(pb["F"])
+        self.T = int(pb["T"])
+
+        sid = pb.get("sector_ids", None)
+        if sid is not None:
+            self.sector_ids = np.asarray(sid, dtype=np.int16)
+
+        # Pre-allocate work arrays (existing method)
+        self._preallocate_work_arrays()
 
     def _preallocate_work_arrays(self):
         """Pre-allocate work arrays for efficiency."""
@@ -437,11 +489,17 @@ class DebentureTradingEnv(gym.Env):
         self.sector_ids = sector_id_wide.values.astype(np.int16)[0]
 
         # Store arrays
-        self.R = np.nan_to_num(R.values.astype(np.float32), nan=0.0)
-        self.RF = np.nan_to_num(RF.values.astype(np.float32).ravel(), nan=0.0)
-        self.IDX = np.nan_to_num(IDX.values.astype(np.float32).ravel(), nan=0.0)
-        self.ACT = np.nan_to_num(A.values.astype(np.float32), nan=0.0)
-        self.X = np.nan_to_num(X, nan=0.0)
+        # 16-bit for continuous arrays, 8-bit for masks
+        self.R  = np.nan_to_num(R.values.astype(np.float16), nan=0.0)
+        self.RF = np.nan_to_num(RF.values.astype(np.float16).ravel(), nan=0.0)
+        self.IDX= np.nan_to_num(IDX.values.astype(np.float16).ravel(), nan=0.0)
+
+        # masks can be tiny (0/1)
+        self.ACT = np.nan_to_num(A.values.astype(np.int8), nan=0).astype(np.int8)
+
+        # features: 16-bit; we will upcast on-the-fly when building obs
+        self.X = np.nan_to_num(X.astype(np.float16), nan=0.0)
+
         self.T = self.R.shape[0]
         self.F = self.X.shape[-1] if self.X.ndim == 3 else 0
 
@@ -535,7 +593,7 @@ class DebentureTradingEnv(gym.Env):
         mask = self.ACT[t].astype(np.int8)
         
         return {
-            'observation': obs.copy(),  # Return copy to avoid external modification
+            'observation': obs,
             'action_mask': mask
         }
 
@@ -788,10 +846,11 @@ class DebentureTradingEnv(gym.Env):
 
 # ------------------------- Factory convenience ---------------------------- #
 
-def make_env_from_panel(panel: pd.DataFrame, **env_kwargs) -> DebentureTradingEnv:
-    """Factory: build DebentureTradingEnv from a panel and EnvConfig kwargs."""
+def make_env_from_panel(panel: pd.DataFrame, **env_kwargs):
+    prebuilt = env_kwargs.pop("prebuilt", None)   # <-- NEW: remove before EnvConfig
     cfg = EnvConfig(**env_kwargs)
-    return DebentureTradingEnv(panel=panel, config=cfg)
+    env = DebentureTradingEnv(panel=panel, config=cfg, prebuilt=prebuilt)
+    return env
 
 # ------------------------------ Quick test -------------------------------- #
 

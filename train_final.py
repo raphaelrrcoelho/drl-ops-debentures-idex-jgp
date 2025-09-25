@@ -29,8 +29,14 @@ import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
+import csv
 import numba
 from numba import jit, prange
+import pickle
+
+import io
+io.DEFAULT_BUFFER_SIZE = 65536
+
 
 # Ensure reproducibility
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -283,8 +289,21 @@ def build_train_panel_with_union_optimized(panel: pd.DataFrame, fold_cfg: Dict[s
         print(f"  Panel shape: {len(train_dates)} × {len(union_ids)} = {len(train_dates) * len(union_ids):,} obs")
 
         # Efficient reindexing
-        idx = pd.MultiIndex.from_product([train_dates, union_ids], names=["date", "debenture_id"])
-        train_aug = panel.reindex(idx)
+        train_aug = panel.loc[
+            (panel.index.get_level_values(0).isin(train_dates)) & 
+            (panel.index.get_level_values(1).isin(union_ids))
+        ].copy()
+        
+        # Only fill missing combinations if needed
+        existing_combos = set(train_aug.index)
+        all_combos = set(pd.MultiIndex.from_product([train_dates, union_ids]))
+        missing_combos = all_combos - existing_combos
+        
+        if missing_combos:
+            # Create minimal DataFrame for missing data
+            missing_idx = pd.MultiIndex.from_tuples(list(missing_combos), names=["date", "debenture_id"])
+            missing_df = pd.DataFrame(index=missing_idx, columns=train_aug.columns)
+            train_aug = pd.concat([train_aug, missing_df]).sort_index()
 
         # Count features
         feature_cols = [c for c in train_aug.columns if c.endswith("_lag1")]
@@ -490,22 +509,20 @@ class DetailedMetricsLoggerCallback(BaseCallback):
             **final_perf
         }
         
-        # Atomic write to avoid corruption
-        try:
-            old = []
-            if os.path.exists(self.out_json_path):
-                with open(self.out_json_path, "r") as f:
-                    old = json.load(f)
-                    if not isinstance(old, list):
-                        old = []
-            old.append(rec)
-            tmp = self.out_json_path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(old, f, indent=2)
-            os.replace(tmp, self.out_json_path)
-            print(f"  Metrics saved to: {self.out_json_path}")
-        except Exception as e:
-            print(f"  ⚠️ WARNING: Failed to save metrics: {e}")
+        # Use CSV append instead of JSON rewrite
+        csv_path = self.out_json_path.replace('.json', '.csv')
+        
+        # Write header if file doesn't exist
+        import csv
+        file_exists = os.path.exists(csv_path)
+        
+        with open(csv_path, 'a', newline='', buffering=65536) as f:
+            fieldnames = list(rec.keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(rec)
 
 # ------------------------ Optimized In-Sample Validation ------------------ #
 
@@ -781,10 +798,8 @@ def train_one_optimized(
                         existing = []
             existing = [r for r in existing if int(r.get("fold", -1)) != fold_i]
             existing.append({"fold": int(fold_i), "ids": list(map(str, union_ids))})
-            tmp = union_path + ".tmp"
-            with open(tmp, "w") as f:
+            with open(union_path, "w") as f:
                 json.dump(existing, f, indent=2)
-            os.replace(tmp, union_path)
         except Exception as e:
             print(f"  ⚠️ WARNING: Could not persist union ids: {e}")
 
@@ -810,28 +825,38 @@ def train_one_optimized(
         print(f"\n[ENVIRONMENT SETUP]")
         print(f"  Parallel environments: {n_envs}")
         print(f"  Vectorization: {vec_kind}")
+
+        cfg0 = EnvConfig(**{**asdict(env_cfg)})
+        cfg0.seed = int(seed * 1000)  # seed for env 0
+        base_env = make_env_from_panel(train_aug, **asdict(cfg0))            # builds _prepare_data once  :contentReference[oaicite:2]{index=2}
+        shared = base_env.export_shared_arrays()                             # new helper
+
         
         def _make_thunk(rank: int):
             def _init():
-                # CRITICAL: Each environment gets a unique seed
+                # unique seed per env as before
                 cfg_i = EnvConfig(**{**asdict(env_cfg)})
                 cfg_i.seed = int(seed * 1000 + rank)
-                
+
                 train_dates = train_aug.index.get_level_values("date").unique()
                 available_steps = len(train_dates)
-                
                 print(f"    Env {rank}: seed={cfg_i.seed}, steps={available_steps}")
-                
+
                 if episode_len is not None and episode_len > available_steps:
                     print(f"    ⚠️ Requested episode_len={episode_len} but only {available_steps} steps available")
                     cfg_i.max_steps = min(episode_len, available_steps - 1)
                 elif episode_len is not None:
                     cfg_i.max_steps = episode_len
-                
+
                 if hasattr(cfg_i, "random_reset_frac") and available_steps < 10:
                     cfg_i.random_reset_frac = 0.0
-                    
-                e = make_env_from_panel(train_aug, **asdict(cfg_i))
+
+                # Reuse the already-built env for rank 0, build light envs for others
+                if rank == 0:
+                    e = base_env
+                else:
+                    e = make_env_from_panel(train_aug, **asdict(cfg_i), prebuilt=shared)
+
                 e = ActionMasker(e, mask_fn)
                 e = SafeRewardWrapper(e)
                 e = SafeObsWrapper(e, clip=getattr(cfg_i, "obs_clip", 7.5) or 7.5)
@@ -839,6 +864,7 @@ def train_one_optimized(
             return _init
 
         thunks = [_make_thunk(i) for i in range(max(1, int(n_envs)))]
+        vec_env = DummyVecEnv(thunks)
         
         if int(n_envs) <= 1 or str(vec_kind).lower() == "dummy":
             vec_env = DummyVecEnv(thunks)
@@ -920,26 +946,62 @@ def train_one_optimized(
             print(f"  Metrics saved to: {metrics_json}")
             model.learn(total_timesteps=int(remaining), callback=callback, progress_bar=True)
 
-        # Save (atomic write)
+        # --- Save in a memory-friendly order ---
+        # 1) Save VecNormalize FIRST (small) while the env is alive
+        try:
+            vecnorm_path = os.path.join(model_dir, f"vecnorm_fold_{fold_i}_seed_{seed}.pkl")
+
+            # Get VecNormalize stats
+            stats = {
+                'obs_rms': vec_env.obs_rms,
+                'ret_rms': vec_env.ret_rms,
+                'clip_obs': vec_env.clip_obs,
+                'clip_reward': vec_env.clip_reward,
+                'gamma': vec_env.gamma,
+                'epsilon': vec_env.epsilon
+            }
+
+            # Buffer write
+            buffer = io.BytesIO()
+            pickle.dump(stats, buffer, protocol=pickle.HIGHEST_PROTOCOL)
+            buffer.seek(0)
+
+            with open(vecnorm_path, 'wb', buffering=65536) as f:
+                f.write(buffer.getvalue())
+            print(f"\n[VECNORM SAVED]")
+            print(f"  Path: {vecnorm_path}")
+        except Exception as e:
+            print(f"[WARN] Could not save VecNormalize: {e}")
+
+        # 2) Detach and free heavy objects BEFORE saving the model
+        try:
+            # Detach env from the model so it won't be serialized / referenced
+            if hasattr(model, "set_env"):
+                model.set_env(None)
+        except Exception:
+            pass
+
+        # Drop rollout buffer to reduce memory peak
+        if hasattr(model, "rollout_buffer"):
+            model.rollout_buffer = None
+
+        # Properly close and delete the env, then GC
+        try:
+            vec_env.close()
+        except Exception:
+            pass
+        del vec_env
+        gc.collect()
+
+
+        # 3) Now save the model atomically (parent is much lighter now)
         final_model_path = os.path.join(model_dir, f"model_fold_{fold_i}_seed_{seed}.zip")
         tmp_path = final_model_path + ".tmp"
         model.save(tmp_path)
         os.replace(tmp_path, final_model_path)
-        print(f"\n[MODEL SAVED]")
+        print(f"[MODEL SAVED]")
         print(f"  Path: {final_model_path}")
-        
-        try:
-            vecnorm_path = os.path.join(model_dir, f"vecnorm_fold_{fold_i}_seed_{seed}.pkl")
-            tmp_path = vecnorm_path + ".tmp"
-            vec_env.save(tmp_path)
-            os.replace(tmp_path, vecnorm_path)
-            print(f"  VecNorm: {vecnorm_path}")
-        except Exception:
-            pass
 
-        vec_env.close()
-        del model
-        gc.collect()
 
     print("\n" + "="*60)
     print(f"FOLD {fold_i} SEED {seed} COMPLETE")

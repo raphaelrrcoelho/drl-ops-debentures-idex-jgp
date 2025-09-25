@@ -6,9 +6,9 @@
 policy: MultiInputPolicy
 total_timesteps: 40960  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-6
-n_steps: 2560       
-batch_size: 256
-n_epochs: 5
+n_steps: 256       
+batch_size: 124
+n_epochs: 10
 gamma: 0.99
 gae_lambda: 0.95
 clip_range: 0.075
@@ -43,6 +43,17 @@ obs_clip: 7.5
 include_prev_weights: false
 include_active_flag: false
 global_stats: true
+use_momentum_features: true
+use_volatility_features: false
+use_relative_value_features: true
+use_duration_features: true
+use_microstructure_features: false
+use_carry_features: true
+use_spread_dynamics: true
+use_risk_adjusted_features: false
+use_sector_curves: true
+use_zscore_features: false
+use_rolling_zscores: false
 
 # Reward configuration
 weight_alpha: 1.0   # Weight for alpha (r - index)
@@ -86,7 +97,7 @@ embargo_days: 3
 seeds: "0,1,2,4"  # Comma-separated string
 
 # Checkpoint and logging
-checkpoint_freq: 50000
+checkpoint_freq: 500000
 tensorboard_log: true
 verbose: 0  # 0=silent, 1=info, 2=debug
 
