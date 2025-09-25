@@ -26,7 +26,7 @@ activation: tanh
 # ========================
 
 # Portfolio constraints
-rebalance_interval: 5
+rebalance_interval: 10
 max_weight: 0.10
 weight_blocks: 100  # For discrete action space (1% granularity)
 allow_cash: true
@@ -94,7 +94,7 @@ lambda_grid: null  # Disabled for faster training
 # Walk-forward configuration
 n_folds: 9
 embargo_days: 3
-seeds: "0,1,2,4"  # Comma-separated string
+seeds: "0,1,2"  # Comma-separated string
 
 # Checkpoint and logging
 checkpoint_freq: 500000

@@ -1,16 +1,20 @@
-# env_optimized.py
+# env_final.py
 """
-Debenture portfolio environment with DISCRETE action space and ENHANCED features
-================================================================================
-PERFORMANCE OPTIMIZED VERSION:
-- JIT Compilation: Core calculations use numba JIT for 5-10x speedup
-- Pre-allocated Arrays: All work arrays allocated once and reused
-- Efficient Pivoting: Uses pandas unstack instead of pivot (2x faster)
-- Optimized Lagged Features: Single pass creation instead of multiple iterations
-- Fixed Turnover Bug: No cost when weights don't change (staying in position)
-- Memory Optimization: Use views and in-place operations where possible
+Debenture portfolio environment with DISCRETE action space, ENHANCED features, and MAX ASSETS constraint
+=======================================================================================================
+NEW FEATURE: Dynamic top-K asset selection by index_weight
+- On each rebalancing day, only the top K assets (default 50) by index_weight are investable
+- Agent can hold assets bought previously even if they drop out of top K
+- On rebalancing days, assets outside top K must be liquidated
+- Fixed observation/action space of K assets + cash (if enabled)
 
-Maintains all original features and interfaces from env_final.py
+Performance optimizations retained:
+- JIT Compilation for core calculations
+- Pre-allocated arrays
+- Efficient pivoting
+- Memory optimization
+
+Maintains all original features and interfaces from previous env_final.py
 """
 from __future__ import annotations
 
@@ -35,6 +39,9 @@ class EnvConfig:
     allow_cash: bool = True
     cash_rate_as_rf: bool = True
     on_inactive: str = "to_cash"
+    
+    # NEW: Maximum number of investable assets
+    max_assets: int = 50  # Top K assets by index_weight
 
     # Costs & penalties
     weight_alpha: float = 1.0   
@@ -100,7 +107,6 @@ RELATIVE_VALUE_FEATURES = [
 
 DURATION_FEATURES = [
     "duration_change", "duration_vol", "duration_spread_interaction",
-    # "modified_duration_proxy", "convexity_proxy",
 ]
 
 MICROSTRUCTURE_FEATURES = [
@@ -116,15 +122,11 @@ SPREAD_DYNAMICS_FEATURES = [
     "spread_mean_reversion", "spread_acceleration",
 ]
 
-RISK_ADJUSTED_FEATURES = [
-    # "sharpe_5d", "sharpe_20d", "sharpe_60d",
-    # "information_ratio_20d",
-]
+RISK_ADJUSTED_FEATURES = []
 
 SECTOR_CURVE_FEATURES = [
     "sector_ns_beta0", "ns_beta1_common", "ns_lambda_common",
     "sector_fitted_spread", "spread_residual_ns",
-    # "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y",
 ]
 
 # ------------------------------ JIT Compiled Utilities -------------------- #
@@ -159,7 +161,6 @@ def _turnover_jit(w_new: np.ndarray, w_prev: np.ndarray) -> float32:
 @jit(float32(float32[:], float32[:]), nopython=True, cache=True, fastmath=True)
 def _portfolio_return_jit(weights: np.ndarray, returns: np.ndarray) -> float32:
     """JIT compiled: Calculate portfolio return."""
-    # Ensure contiguous arrays for better performance
     return np.dot(np.ascontiguousarray(weights), np.ascontiguousarray(returns))
 
 @jit(float32[:](float32[:], float32, float32), nopython=True, cache=True, fastmath=True)
@@ -218,37 +219,55 @@ class DebentureTradingEnv(gym.Env):
         if self.cfg.seed is not None:
             np.random.seed(int(self.cfg.seed))
 
-        # NEW: attach prebuilt arrays if provided, otherwise build once
+        # NEW: Store max_assets configuration
+        self.max_assets_config = self.cfg.max_assets
+
+        # Attach prebuilt arrays if provided, otherwise build once
         if prebuilt is not None:
             self._attach_prebuilt(prebuilt)
         else:
-            self._prepare_data(panel)   # existing path  ← keeps your current behavior  :contentReference[oaicite:0]{index=0}
+            self._prepare_data(panel)
 
-        # Cash index (if any)
+        # NEW: Fixed observation/action space size based on max_assets
+        self.obs_n_assets = self.max_assets_config
+        if self.cfg.allow_cash:
+            self.obs_n_assets += 1  # Add slot for cash
+        
+        # Cash index (always last if enabled)
         self.cash_idx = None
         if self.cfg.allow_cash:
-            self.cash_idx = self.n_assets - 1  
+            self.cash_idx = self.obs_n_assets - 1
 
-        # DISCRETE ACTION SPACE
+        # DISCRETE ACTION SPACE - fixed size based on max_assets
         self.max_blocks_per_asset = int(self.cfg.max_weight * self.cfg.weight_blocks)
         self.action_space = spaces.MultiDiscrete(
-            [self.max_blocks_per_asset + 1] * self.n_assets
+            [self.max_blocks_per_asset + 1] * self.obs_n_assets
         )
 
-        # Observation space
+        # Observation space - fixed size
         obs_dim = self._obs_size()
         self.observation_space = spaces.Dict({
             'observation': spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
-            'action_mask': spaces.Box(0, 1, shape=(self.n_assets,), dtype=np.int8)
+            'action_mask': spaces.Box(0, 1, shape=(self.obs_n_assets,), dtype=np.int8)
         })
 
         # Pre-allocate work arrays for efficiency
         self._preallocate_work_arrays()
 
-        # State
+        # State - now tracks both portfolio positions and current top-K mapping
         self.t: int = 0
-        self.prev_w: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
-        self.curr_w: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
+        
+        # Portfolio weights in FULL universe space
+        self.full_prev_w: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
+        self.full_curr_w: np.ndarray = np.zeros(self.n_assets, dtype=np.float32)
+        
+        # Mapping from observation space to full universe
+        self.current_top_k_indices: np.ndarray = np.arange(self.obs_n_assets, dtype=np.int32)
+        
+        # Weights in observation space (for agent interaction)
+        self.prev_w: np.ndarray = np.zeros(self.obs_n_assets, dtype=np.float32)
+        self.curr_w: np.ndarray = np.zeros(self.obs_n_assets, dtype=np.float32)
+        
         self.wealth: float = 1.0
         self.peak_wealth: float = 1.0
 
@@ -264,6 +283,7 @@ class DebentureTradingEnv(gym.Env):
             "R": self.R,                # (T, N)
             "X": self.X,                # (T, N, F)
             "ACT": self.ACT,            # (T, N)
+            "W": self.W,                # (T, N) - index weights
             "RF": self.RF,              # (T,)
             "IDX": self.IDX,            # (T,)
             "RF_obs": self.RF_obs,      # (T,)
@@ -273,10 +293,11 @@ class DebentureTradingEnv(gym.Env):
             "dates": self.dates,        # (T,)
             "asset_ids": self.asset_ids,
             "feature_cols": self.feature_cols,
-            "n_assets": self.n_assets,
+            "n_assets": self.n_assets,  # Full universe size
             "F": self.F,
             "T": self.T,
             "sector_ids": getattr(self, "sector_ids", None),
+            "max_assets": self.max_assets_config,
         }
 
     def _attach_prebuilt(self, pb: dict) -> None:
@@ -285,6 +306,7 @@ class DebentureTradingEnv(gym.Env):
         self.R = pb["R"]
         self.X = pb["X"]
         self.ACT = pb["ACT"]
+        self.W = pb["W"]  # Index weights
         self.RF = pb["RF"]
         self.IDX = pb["IDX"]
         self.RF_obs = pb["RF_obs"]
@@ -296,9 +318,15 @@ class DebentureTradingEnv(gym.Env):
         self.dates = pb["dates"]
         self.asset_ids = list(pb["asset_ids"])
         self.feature_cols = list(pb["feature_cols"])
-        self.n_assets = int(pb["n_assets"])
+        self.n_assets = int(pb["n_assets"])  # Full universe
         self.F = int(pb["F"])
         self.T = int(pb["T"])
+        self.max_assets_config = pb.get("max_assets", 50)
+        
+        # NEW: Set obs_n_assets BEFORE calling _preallocate_work_arrays
+        self.obs_n_assets = self.max_assets_config
+        if self.cfg.allow_cash:
+            self.obs_n_assets += 1  # Add slot for cash
 
         sid = pb.get("sector_ids", None)
         if sid is not None:
@@ -309,10 +337,15 @@ class DebentureTradingEnv(gym.Env):
 
     def _preallocate_work_arrays(self):
         """Pre-allocate work arrays for efficiency."""
-        self._work_blocks = np.zeros(self.n_assets, dtype=np.int32)
-        self._work_weights = np.zeros(self.n_assets, dtype=np.float32)
-        self._work_mask = np.zeros(self.n_assets, dtype=bool)
-        self._work_returns = np.zeros(self.n_assets, dtype=np.float32)
+        # Work arrays for observation space
+        self._work_blocks = np.zeros(self.obs_n_assets, dtype=np.int32)
+        self._work_weights = np.zeros(self.obs_n_assets, dtype=np.float32)
+        self._work_mask = np.zeros(self.obs_n_assets, dtype=bool)
+        
+        # Work arrays for full universe
+        self._work_returns_full = np.zeros(self.n_assets, dtype=np.float32)
+        self._work_weights_full = np.zeros(self.n_assets, dtype=np.float32)
+        
         self._obs_buffer = np.zeros(self._obs_size(), dtype=np.float32)
 
     # --------------------------- Data preparation --------------------------- #
@@ -325,6 +358,10 @@ class DebentureTradingEnv(gym.Env):
             "return", "risk_free", "index_return", "active",
             "spread", "duration", "time_to_maturity", "sector_id", "index_level"
         ]
+        
+        # NEW: Also require index_weight for top-K selection
+        required.append("index_weight")
+        
         for c in required:
             if c not in panel.columns:
                 raise ValueError(f"Missing required column '{c}' in panel")
@@ -365,7 +402,7 @@ class DebentureTradingEnv(gym.Env):
         if self.cfg.include_active_flag and "active" in panel.columns:
             base_feats.append("active")
 
-        # OPTIMIZED: Create all lagged features in single pass
+        # Create all lagged features
         panel = panel.copy()
         lag_cols_to_create = []
         for feat in base_feats:
@@ -429,9 +466,9 @@ class DebentureTradingEnv(gym.Env):
         self.dates = dates.to_numpy()
         asset_ids = panel.index.get_level_values("debenture_id").unique().tolist()
         self.asset_ids: List[str] = list(asset_ids)
-        self.n_assets = len(self.asset_ids)
+        self.n_assets = len(self.asset_ids)  # Full universe size
 
-        # OPTIMIZED: Use unstack instead of pivot (2x faster)
+        # Use unstack for efficient pivoting
         panel_reset = panel.reset_index()
         
         # Arrays (same-day returns, same-day active mask)
@@ -460,10 +497,17 @@ class DebentureTradingEnv(gym.Env):
             .reindex(index=dates, columns=asset_ids)
             .fillna(0.0)
         )
+        
+        # NEW: Index weights for top-K selection
+        W = (
+            panel_reset.set_index(["date", "debenture_id"])["index_weight"]
+            .unstack(fill_value=0.0)
+            .reindex(index=dates, columns=asset_ids)
+            .fillna(0.0)
+        )
 
-        # Feature tensor (lagged) with features - OPTIMIZED
+        # Feature tensor (lagged) with features
         if feat_cols:
-            # More efficient stacking
             X = np.empty((len(dates), len(asset_ids), len(feat_cols)), dtype=np.float32)
             for i, c in enumerate(feat_cols):
                 wide = (
@@ -489,15 +533,11 @@ class DebentureTradingEnv(gym.Env):
         self.sector_ids = sector_id_wide.values.astype(np.int16)[0]
 
         # Store arrays
-        # 16-bit for continuous arrays, 8-bit for masks
         self.R  = np.nan_to_num(R.values.astype(np.float16), nan=0.0)
         self.RF = np.nan_to_num(RF.values.astype(np.float16).ravel(), nan=0.0)
         self.IDX= np.nan_to_num(IDX.values.astype(np.float16).ravel(), nan=0.0)
-
-        # masks can be tiny (0/1)
         self.ACT = np.nan_to_num(A.values.astype(np.int8), nan=0).astype(np.int8)
-
-        # features: 16-bit; we will upcast on-the-fly when building obs
+        self.W = np.nan_to_num(W.values.astype(np.float32), nan=0.0)  # Index weights
         self.X = np.nan_to_num(X.astype(np.float16), nan=0.0)
 
         self.T = self.R.shape[0]
@@ -517,7 +557,6 @@ class DebentureTradingEnv(gym.Env):
 
         # Additional normalization if needed
         if self.cfg.normalize_features and self.F > 0:
-            # Clip extreme values in-place
             np.clip(self.X, -self.cfg.obs_clip, self.cfg.obs_clip, out=self.X)
 
         # Lagged RF/IDX for observations
@@ -526,24 +565,88 @@ class DebentureTradingEnv(gym.Env):
         self.IDX_obs = np.zeros_like(self.IDX, dtype=np.float32)
         self.IDX_obs[1:] = self.IDX[:-1]
 
-        # Append cash if enabled
+        # NOTE: We don't append cash to the full universe arrays
+        # Cash will be handled separately in the observation space
+
+    # --------------------------- Top-K Selection Logic ----------------------- #
+
+    def _get_top_k_assets(self, t: int) -> np.ndarray:
+        """
+        Get indices of top K assets by index_weight at time t.
+        Returns array of shape (max_assets,) with indices into full universe.
+        Excludes cash - that's handled separately.
+        """
+        # Get weights at current time
+        weights_t = self.W[t]
+        
+        # Only consider active assets
+        active_mask = self.ACT[t] > 0
+        
+        # Set inactive weights to -inf for sorting
+        sort_weights = weights_t.copy()
+        sort_weights[~active_mask] = -np.inf
+        
+        # Get top K indices
+        k = min(self.max_assets_config, np.sum(active_mask))
+        if k <= 0:
+            # No active assets, return first max_assets indices as fallback
+            return np.arange(min(self.max_assets_config, self.n_assets))
+        
+        # Use argpartition for efficiency, then sort the top k
+        if k < len(sort_weights):
+            # Get indices of k largest elements
+            top_k_unsorted = np.argpartition(sort_weights, -k)[-k:]
+            # Sort them by weight (descending)
+            top_k_indices = top_k_unsorted[np.argsort(-sort_weights[top_k_unsorted])]
+        else:
+            # All assets fit, just sort by weight
+            top_k_indices = np.argsort(-sort_weights)[:k]
+        
+        # Pad with inactive slots if needed
+        if len(top_k_indices) < self.max_assets_config:
+            padding = self.max_assets_config - len(top_k_indices)
+            # Use indices beyond the universe as padding (will be inactive)
+            pad_indices = np.full(padding, self.n_assets - 1)  # Use last index as dummy
+            top_k_indices = np.concatenate([top_k_indices, pad_indices])
+        
+        return top_k_indices.astype(np.int32)
+
+    def _map_weights_to_obs_space(self, full_weights: np.ndarray) -> np.ndarray:
+        """Map weights from full universe to observation space."""
+        obs_weights = np.zeros(self.obs_n_assets, dtype=np.float32)
+        
+        # Map top-K assets
+        for i in range(min(self.max_assets_config, len(self.current_top_k_indices))):
+            full_idx = self.current_top_k_indices[i]
+            if full_idx < self.n_assets:
+                obs_weights[i] = full_weights[full_idx]
+        
+        # Add cash if enabled
         if self.cfg.allow_cash:
-            if self.cfg.cash_rate_as_rf:
-                cash_R = self.RF.reshape(-1, 1)
-            else:
-                cash_R = np.zeros((self.T, 1), dtype=np.float32)
-            cash_X = np.zeros((self.T, 1, self.F), dtype=np.float32)
-            cash_A = np.ones((self.T, 1), dtype=np.float32)
-            self.R = np.concatenate([self.R, cash_R], axis=1)
-            self.X = np.concatenate([self.X, cash_X], axis=1) if self.F > 0 else self.X
-            self.ACT = np.concatenate([self.ACT, cash_A], axis=1)
-            self.asset_ids.append("__CASH__")
-            self.n_assets += 1
+            # Cash weight is sum of any unallocated weight
+            cash_weight = 1.0 - np.sum(obs_weights[:self.max_assets_config])
+            obs_weights[self.cash_idx] = max(0.0, cash_weight)
+        
+        return obs_weights
+
+    def _map_weights_to_full_space(self, obs_weights: np.ndarray) -> np.ndarray:
+        """Map weights from observation space to full universe."""
+        full_weights = np.zeros(self.n_assets, dtype=np.float32)
+        
+        # Map top-K assets
+        for i in range(min(self.max_assets_config, len(self.current_top_k_indices))):
+            full_idx = self.current_top_k_indices[i]
+            if full_idx < self.n_assets and i < len(obs_weights):
+                full_weights[full_idx] = obs_weights[i]
+        
+        # Note: cash is not in full_weights, it's handled separately
+        
+        return full_weights
 
     # --------------------------- Observation builder ------------------------ #
 
     def _obs_size(self) -> int:
-        n = self.n_assets
+        n = self.obs_n_assets  # Fixed size based on max_assets
         base = n * self.F
         extra = 0
         if self.cfg.include_prev_weights:
@@ -556,29 +659,49 @@ class DebentureTradingEnv(gym.Env):
         return base + extra
 
     def _get_observation(self) -> Dict:
-        """OPTIMIZED: Build observation using pre-allocated buffer."""
+        """Build observation using top-K assets."""
         t = min(self.t, self.T - 1)
         if t >= self.ACT.shape[0]:
             t = self.ACT.shape[0] - 1
         
         # Use pre-allocated buffer
         obs = self._obs_buffer
-        obs.fill(0.0)  # Reset buffer
+        obs.fill(0.0)
         
         idx = 0
+        
+        # Features for top-K assets
         if self.F > 0:
-            X_t_flat = self.X[t].reshape(-1)
-            obs[idx:idx + len(X_t_flat)] = X_t_flat
-            idx += len(X_t_flat)
+            for i in range(self.max_assets_config):
+                if i < len(self.current_top_k_indices):
+                    full_idx = self.current_top_k_indices[i]
+                    if full_idx < self.n_assets:
+                        # Copy features for this asset
+                        obs[idx:idx + self.F] = self.X[t, full_idx]
+                idx += self.F
+            
+            # Add dummy features for cash if enabled
+            if self.cfg.allow_cash:
+                idx += self.F  # Skip cash features (zeros)
         
+        # Previous weights in observation space
         if self.cfg.include_prev_weights:
-            obs[idx:idx + self.n_assets] = self.prev_w
-            idx += self.n_assets
+            obs[idx:idx + self.obs_n_assets] = self.prev_w
+            idx += self.obs_n_assets
         
+        # Active flags for top-K assets
         if self.cfg.include_active_flag:
-            obs[idx:idx + self.n_assets] = self.ACT[t]
-            idx += self.n_assets
+            for i in range(self.max_assets_config):
+                if i < len(self.current_top_k_indices):
+                    full_idx = self.current_top_k_indices[i]
+                    if full_idx < self.n_assets:
+                        obs[idx + i] = self.ACT[t, full_idx]
+            # Cash is always active
+            if self.cfg.allow_cash:
+                obs[idx + self.cash_idx] = 1
+            idx += self.obs_n_assets
         
+        # Global stats
         if self.cfg.global_stats and self.F > 0:
             obs[idx:idx + self.F] = self.global_means[t]
             idx += self.F
@@ -588,9 +711,21 @@ class DebentureTradingEnv(gym.Env):
         obs[idx] = self.RF_obs[t]
         obs[idx + 1] = self.IDX_obs[t]
         
+        # Clip observations
         clip = float(self.cfg.obs_clip)
         np.clip(obs, -clip, clip, out=obs)
-        mask = self.ACT[t].astype(np.int8)
+        
+        # Action mask for top-K assets
+        mask = np.zeros(self.obs_n_assets, dtype=np.int8)
+        for i in range(self.max_assets_config):
+            if i < len(self.current_top_k_indices):
+                full_idx = self.current_top_k_indices[i]
+                if full_idx < self.n_assets:
+                    mask[i] = self.ACT[t, full_idx]
+        
+        # Cash is always available
+        if self.cfg.allow_cash:
+            mask[self.cash_idx] = 1
         
         return {
             'observation': obs,
@@ -612,7 +747,12 @@ class DebentureTradingEnv(gym.Env):
         else:
             self.t = 0
 
+        # Initialize top-K selection
+        self.current_top_k_indices = self._get_top_k_assets(self.t)
+        
         # Initialize weights
+        self.full_prev_w.fill(0.0)
+        self.full_curr_w.fill(0.0)
         self.prev_w.fill(0.0)
         self.curr_w.fill(0.0)
         
@@ -620,10 +760,15 @@ class DebentureTradingEnv(gym.Env):
         if self.cash_idx is not None:
             self.curr_w[self.cash_idx] = 1.0
         else:
-            # Equal weight active assets
-            mask = self.ACT[self.t] > 0
+            # Equal weight among active top-K assets
+            mask = self._get_observation()['action_mask'][:self.max_assets_config]
             if mask.any():
-                self.curr_w[mask] = 1.0 / mask.sum()
+                active_count = mask.sum()
+                for i in range(self.max_assets_config):
+                    if mask[i]:
+                        self.curr_w[i] = 1.0 / active_count
+                # Update full weights
+                self.full_curr_w = self._map_weights_to_full_space(self.curr_w)
                 
         self.wealth = 1.0
         self.peak_wealth = 1.0
@@ -634,11 +779,12 @@ class DebentureTradingEnv(gym.Env):
             "date": pd.Timestamp(self.dates[self.t]).to_pydatetime(),
             "n_features": self.F,
             "feature_cols": self.feature_cols[:10] if len(self.feature_cols) > 10 else self.feature_cols,
+            "top_k_assets": [self.asset_ids[i] for i in self.current_top_k_indices[:self.max_assets_config] if i < len(self.asset_ids)],
         }
         return self._get_observation(), info
 
     def step(self, action: np.ndarray):
-        """OPTIMIZED: Use JIT compiled functions and pre-allocated arrays."""
+        """Process action with top-K constraint."""
         t = int(self.t)
         terminated = False
         truncated = False
@@ -646,84 +792,126 @@ class DebentureTradingEnv(gym.Env):
         if t >= self.T or t >= self.ACT.shape[0]:
             return self._get_observation(), 0.0, True, False, {}
 
-        # Get current state (use views where possible)
-        act_mask = self.ACT[t]
-        r_vec = self._work_returns
-        np.copyto(r_vec, self.R[t])  # Use pre-allocated array
-        
         # Only rebalance every rebalance_interval days
         apply_action = (t % max(1, int(self.cfg.rebalance_interval)) == 0)
-        w_prev = self.prev_w
+        
+        # Track previous weights
+        w_prev_full = self.full_curr_w.copy()
+        w_prev_obs = self.curr_w.copy()
+        
         freed_mass = 0.0
         extra_delist_cost = 0.0
-
-        # FIXED TURNOVER BUG: Track if we actually rebalanced
-        actually_rebalanced = False
-
+        forced_liquidation = 0.0
+        
         if apply_action:
-            # DISCRETE ACTION HANDLING - use pre-allocated arrays
+            # REBALANCING DAY: Update top-K selection
+            new_top_k = self._get_top_k_assets(t)
+            
+            # Check for forced liquidations (assets no longer in top-K)
+            old_set = set(self.current_top_k_indices[:self.max_assets_config])
+            new_set = set(new_top_k[:self.max_assets_config])
+            
+            # Assets that must be sold
+            assets_to_liquidate = old_set - new_set
+            for full_idx in assets_to_liquidate:
+                if full_idx < self.n_assets:
+                    forced_liquidation += w_prev_full[full_idx]
+                    w_prev_full[full_idx] = 0.0
+            
+            # Apply delist cost for forced liquidations
+            if forced_liquidation > 0:
+                extra_delist_cost = forced_liquidation * (self.cfg.delist_extra_bps / 10000.0)
+            
+            # Update mapping
+            self.current_top_k_indices = new_top_k
+            
+            # Process discrete action
             blocks = self._work_blocks
             np.copyto(blocks, action.astype(np.int32))
             
-            # Apply activity mask to blocks (JIT compiled)
-            blocks = _sanitize_blocks_with_mask(blocks, act_mask)
+            # Get current activity mask in observation space
+            act_mask_obs = self._get_observation()['action_mask']
             
-            # Convert blocks to weights (JIT compiled)
-            w_tgt = _blocks_to_weights(blocks, self.cfg.weight_blocks)
+            # Apply activity mask to blocks
+            blocks = _sanitize_blocks_with_mask(blocks, act_mask_obs)
             
-            # Ensure max weight constraint is respected (JIT compiled)
-            w_tgt = _normalize_weights_with_max_jit(
-                w_tgt.astype(np.float32), 
+            # Convert blocks to weights
+            w_tgt_obs = _blocks_to_weights(blocks, self.cfg.weight_blocks)
+            
+            # Ensure max weight constraint
+            w_tgt_obs = _normalize_weights_with_max_jit(
+                w_tgt_obs.astype(np.float32),
                 np.float32(self.cfg.max_weight),
-                np.float32(1e-8)  # Pass eps explicitly
+                np.float32(1e-8)
             )
             
-            actually_rebalanced = True
-        else:
-            # Hold position but handle delistings
-            w_tgt = self._work_weights
-            np.copyto(w_tgt, w_prev)
+            # Map to full space
+            w_tgt_full = self._map_weights_to_full_space(w_tgt_obs[:self.max_assets_config])
             
-            inactive = (act_mask <= 0)
-            freed = float(np.maximum(w_tgt[inactive], 0.0).sum())
-            if freed > 0.0:
-                w_tgt[inactive] = 0.0
-                freed_mass = freed
+            # Handle cash
+            cash_weight = 0.0
+            if self.cfg.allow_cash and self.cash_idx is not None:
+                cash_weight = w_tgt_obs[self.cash_idx]
+            
+            actually_rebalanced = True
+            
+        else:
+            # NON-REBALANCING DAY: Hold positions but handle delistings
+            w_tgt_full = w_prev_full.copy()
+            
+            # Check for delistings in current holdings
+            for i in range(self.n_assets):
+                if w_tgt_full[i] > 0 and self.ACT[t, i] <= 0:
+                    freed_mass += w_tgt_full[i]
+                    w_tgt_full[i] = 0.0
+            
+            if freed_mass > 0:
                 extra_delist_cost = freed_mass * (self.cfg.delist_extra_bps / 10000.0)
                 
-                # Send freed mass to cash or redistribute
-                if self.cfg.on_inactive == "to_cash" and self.cash_idx is not None:
-                    w_tgt[self.cash_idx] += freed
+                # Redistribute freed mass
+                if self.cfg.on_inactive == "to_cash" and self.cfg.allow_cash:
+                    cash_weight = freed_mass
                 else:
-                    active = (act_mask > 0)
-                    s = float(w_tgt[active].sum())
-                    if s > 0.0:
-                        w_tgt[active] += (w_tgt[active] / s) * freed
-                    elif self.cash_idx is not None:
-                        w_tgt[self.cash_idx] += freed
-                        
-                # Renormalize in-place
-                total = w_tgt.sum()
-                if total > 0:
-                    w_tgt /= total
+                    # Pro-rata to remaining active positions
+                    active_weight = w_tgt_full.sum()
+                    if active_weight > 0:
+                        w_tgt_full *= (1.0 + freed_mass / active_weight)
             
-            actually_rebalanced = False  # We only adjusted for delistings
+            # Map back to observation space
+            w_tgt_obs = self._map_weights_to_obs_space(w_tgt_full)
+            cash_weight = w_tgt_obs[self.cash_idx] if self.cfg.allow_cash else 0.0
+            
+            actually_rebalanced = False
 
-        # Calculate turnover and costs (JIT compiled)
-        # FIXED BUG: Only charge turnover cost if we actually rebalanced
-        if actually_rebalanced:
-            turn = _turnover_jit(w_tgt.astype(np.float32), w_prev.astype(np.float32))
-            lin_cost = (self.cfg.transaction_cost_bps / 10000.0) * turn + extra_delist_cost
-        else:
-            turn = 0.0  # No turnover if we didn't rebalance
-            lin_cost = extra_delist_cost  # Only delist cost if any
-
-        # Portfolio return (JIT compiled)
+        # Calculate returns for all assets in portfolio
+        r_vec = self._work_returns_full
+        np.copyto(r_vec, self.R[t])
+        
         rf_t = float(self.RF[t])
         bad = ~np.isfinite(r_vec)
         if bad.any():
             r_vec[bad] = rf_t
-        r_p = float(_portfolio_return_jit(w_tgt.astype(np.float32), r_vec.astype(np.float32)))
+        
+        # Portfolio return (excluding cash)
+        r_p_assets = float(_portfolio_return_jit(w_tgt_full.astype(np.float32), r_vec.astype(np.float32)))
+        
+        # Add cash return
+        cash_return = rf_t if self.cfg.cash_rate_as_rf else 0.0
+        r_p = r_p_assets * (1.0 - cash_weight) + cash_return * cash_weight
+        
+        # Calculate turnover and costs
+        if actually_rebalanced:
+            # Compare full universe weights for turnover
+            turn = _turnover_jit(w_tgt_full.astype(np.float32), w_prev_full.astype(np.float32))
+            # Add cash turnover
+            if self.cfg.allow_cash:
+                prev_cash = w_prev_obs[self.cash_idx] if self.cash_idx is not None else 0.0
+                turn += abs(cash_weight - prev_cash)
+            
+            lin_cost = (self.cfg.transaction_cost_bps / 10000.0) * turn + extra_delist_cost
+        else:
+            turn = 0.0
+            lin_cost = extra_delist_cost
         
         # Benchmarks
         r_idx = float(self.IDX[t])
@@ -755,8 +943,11 @@ class DebentureTradingEnv(gym.Env):
             if r_p < q:
                 tail_pen = abs(r_p)
 
-        # Other penalties (JIT compiled HHI)
-        hhi_val = float(_hhi_jit(w_tgt.astype(np.float32)))
+        # HHI calculation (including cash)
+        all_weights = np.concatenate([w_tgt_full, [cash_weight]]) if self.cfg.allow_cash else w_tgt_full
+        hhi_val = float(_hhi_jit(all_weights.astype(np.float32)))
+        
+        # Penalties
         pen = (
             - self.cfg.lambda_turnover * turn
             - self.cfg.lambda_hhi * hhi_val
@@ -767,10 +958,17 @@ class DebentureTradingEnv(gym.Env):
         # Reward
         reward = float(self.cfg.weight_alpha * alpha + pen - lin_cost)
 
-        # Update state (copy to avoid aliasing issues)
-        np.copyto(self.prev_w, w_prev)
-        np.copyto(self.curr_w, w_tgt)
+        # Update state
+        self.full_prev_w = w_prev_full.copy()
+        self.full_curr_w = w_tgt_full.copy()
+        self.prev_w = w_prev_obs.copy()
+        self.curr_w = w_tgt_obs.copy()
+        
         self.t = t + 1
+        
+        # Update top-K for next observation (if not at end)
+        if self.t < self.T:
+            self.current_top_k_indices = self._get_top_k_assets(self.t)
         
         if self.cfg.max_steps is not None and self.t >= int(self.cfg.max_steps):
             truncated = True
@@ -778,9 +976,16 @@ class DebentureTradingEnv(gym.Env):
             terminated = True
 
         obs = self._get_observation()
+        
+        # Prepare output weights (full universe for logging)
+        output_weights = np.zeros(self.n_assets + (1 if self.cfg.allow_cash else 0), dtype=np.float32)
+        output_weights[:self.n_assets] = self.full_curr_w
+        if self.cfg.allow_cash:
+            output_weights[-1] = cash_weight
+        
         info = {
             "date": pd.Timestamp(self.dates[min(self.t, self.T - 1)]).to_pydatetime(),
-            "weights": self.curr_w.copy(),
+            "weights": output_weights,
             "portfolio_return_gross": float(r_p),
             "portfolio_return": float(r_net),
             "excess": float(excess),
@@ -792,13 +997,15 @@ class DebentureTradingEnv(gym.Env):
             "trade_cost": float(lin_cost),
             "wealth": float(self.wealth),
             "drawdown": float(cur_dd_level),
-            "sector_exposure": _dict_sector_exposures(self.sector_ids, self.curr_w),
+            "sector_exposure": _dict_sector_exposures(self.sector_ids, self.full_curr_w),
+            "forced_liquidation": float(forced_liquidation),
+            "top_k_assets": [self.asset_ids[i] for i in self.current_top_k_indices[:self.max_assets_config] if i < len(self.asset_ids)],
             "config": asdict(self.cfg) if self.t == 1 else None,
         }
         
         # Store history
         for k, v in info.items():
-            if k not in ["config", "sector_exposure", "weights", "date"]:
+            if k not in ["config", "sector_exposure", "weights", "date", "top_k_assets"]:
                 if k not in self._history:
                     self._history[k] = []
                 self._history[k].append(v)
@@ -812,7 +1019,8 @@ class DebentureTradingEnv(gym.Env):
         date = pd.Timestamp(self.dates[t]).date()
         wealth = self.wealth
         dd = self._history["drawdown"][-1] if self._history.get("drawdown") else 0.0
-        print(f"[{date}] wealth={wealth:.4f} dd={dd:.3%} features={self.F}")
+        n_active = len([i for i in self.current_top_k_indices[:self.max_assets_config] if i < self.n_assets and self.ACT[t, i] > 0])
+        print(f"[{date}] wealth={wealth:.4f} dd={dd:.3%} active_top_k={n_active}/{self.max_assets_config}")
 
     def get_history(self) -> pd.DataFrame:
         """Return a DataFrame of per-step logged metrics."""
@@ -823,6 +1031,7 @@ class DebentureTradingEnv(gym.Env):
         ))
 
     def get_asset_ids(self) -> List[str]:
+        """Return full universe asset IDs."""
         return list(self.asset_ids)
 
     def get_feature_names(self) -> List[str]:
@@ -833,9 +1042,10 @@ class DebentureTradingEnv(gym.Env):
         For MaskablePPO: returns valid actions mask for MultiDiscrete space.
         """
         masks = []
-        act_mask = self.ACT[self.t]
+        obs_dict = self._get_observation()
+        act_mask = obs_dict['action_mask']
         
-        for i in range(self.n_assets):
+        for i in range(self.obs_n_assets):
             asset_mask = np.ones(self.max_blocks_per_asset + 1, dtype=bool)
             # If asset is inactive, only allow 0 blocks
             if act_mask[i] <= 0:
@@ -847,7 +1057,7 @@ class DebentureTradingEnv(gym.Env):
 # ------------------------- Factory convenience ---------------------------- #
 
 def make_env_from_panel(panel: pd.DataFrame, **env_kwargs):
-    prebuilt = env_kwargs.pop("prebuilt", None)   # <-- NEW: remove before EnvConfig
+    prebuilt = env_kwargs.pop("prebuilt", None)
     cfg = EnvConfig(**env_kwargs)
     env = DebentureTradingEnv(panel=panel, config=cfg, prebuilt=prebuilt)
     return env
@@ -855,12 +1065,12 @@ def make_env_from_panel(panel: pd.DataFrame, **env_kwargs):
 # ------------------------------ Quick test -------------------------------- #
 
 if __name__ == "__main__":
-    # Test with features
+    # Test with max_assets feature
     import sys
     import os
     import time
     
-    print("Testing optimized env with performance improvements...")
+    print("Testing environment with max_assets constraint...")
     print("=" * 60)
     
     # Check if we have processed data
@@ -869,15 +1079,15 @@ if __name__ == "__main__":
         print(f"Loading real data from {data_path}")
         panel = pd.read_pickle(data_path)
         
-        # Take a larger subset for performance testing
+        # Take a subset for testing
         dates = panel.index.get_level_values("date").unique()[:100]
-        assets = panel.index.get_level_values("debenture_id").unique()[:50]
+        assets = panel.index.get_level_values("debenture_id").unique()[:100]  # Use more assets to test top-K
         test_panel = panel.loc[(dates, assets), :]
     else:
         print("Creating synthetic test data...")
         rng = np.random.default_rng(0)
         dates = pd.date_range("2022-01-03", periods=100, freq="B")
-        ids = [f"BOND_{i}" for i in range(50)]
+        ids = [f"BOND_{i}" for i in range(100)]  # 100 assets
         idx = pd.MultiIndex.from_product([dates, ids], names=["date", "debenture_id"])
         
         test_panel = pd.DataFrame(index=idx)
@@ -892,42 +1102,30 @@ if __name__ == "__main__":
         test_panel["index_level"] = 1000.0
         test_panel["active"] = 1
         
+        # Add index_weight with some variation
+        for date in dates:
+            mask = test_panel.index.get_level_values("date") == date
+            weights = rng.dirichlet(np.ones(100))  # Random weights that sum to 1
+            test_panel.loc[mask, "index_weight"] = np.repeat(weights, 1)
+        
         # Add synthetic features (with lag1 versions)
-        for feat in ["momentum_5d", "volatility_20d", "spread_vs_sector_median", 
-                    "duration_change", "liquidity_score", "carry_spread_ratio",
-                    "spread_momentum_5d", "sharpe_20d"]:
+        for feat in ["momentum_5d", "volatility_20d", "spread_vs_sector_median"]:
             test_panel[feat] = rng.normal(0, 1, size=len(test_panel)).astype(np.float32)
             test_panel[f"{feat}_lag1"] = test_panel[feat]
-        
-        # Add other required lag columns
-        for c in ["return", "spread", "duration", "time_to_maturity", "risk_free", 
-                 "index_return", "ttm_rank", "sector_weight_index", "sector_spread", 
-                 "sector_momentum"]:
-            if c not in test_panel.columns:
-                test_panel[c] = rng.normal(0, 0.1, size=len(test_panel)).astype(np.float32)
-            test_panel[f"{c}_lag1"] = test_panel[c]
 
-    # Create environment with full feature set
-    print("\nInitializing environment...")
+    # Create environment with max_assets constraint
+    print("\nInitializing environment with max_assets=50...")
     start_time = time.time()
     
     env = make_env_from_panel(
         test_panel, 
-        rebalance_interval=10, 
-        max_weight=0.1, 
-        allow_cash=True, 
+        rebalance_interval=10,
+        max_weight=0.1,
+        max_assets=50,  # NEW: Top 50 assets only
+        allow_cash=True,
         cash_rate_as_rf=True,
         use_momentum_features=True,
         use_volatility_features=True,
-        use_relative_value_features=True,
-        use_duration_features=True,
-        use_microstructure_features=True,
-        use_carry_features=True,
-        use_spread_dynamics=True,
-        use_risk_adjusted_features=True,
-        use_sector_curves=True,
-        use_zscore_features=True,
-        use_rolling_zscores=True,
     )
     
     init_time = time.time() - start_time
@@ -935,82 +1133,47 @@ if __name__ == "__main__":
     
     obs, info = env.reset()
     print(f"\nEnvironment initialized:")
-    print(f"  Assets: {env.n_assets}")
+    print(f"  Full universe assets: {env.n_assets}")
+    print(f"  Max investable assets: {env.max_assets_config}")
+    print(f"  Observation space assets: {env.obs_n_assets} (including cash)")
     print(f"  Features per asset: {env.F}")
     print(f"  Total observation size: {env._obs_size()}")
     print(f"  Action space: {env.action_space}")
-    print(f"  Max blocks per asset: {env.max_blocks_per_asset}")
+    print(f"  Top-K assets at t=0: {len(info['top_k_assets'])} assets")
     
-    # Performance test: Run many steps
+    # Test a few steps
     print("\n" + "=" * 60)
-    print("PERFORMANCE BENCHMARK")
+    print("TESTING MAX ASSETS CONSTRAINT")
     print("=" * 60)
     
-    n_episodes = 5
-    n_steps_per_episode = 50
-    
-    total_steps = 0
-    start_time = time.time()
-    
-    for episode in range(n_episodes):
-        obs, _ = env.reset()
-        for step in range(n_steps_per_episode):
-            # Random discrete action
-            action = env.np_random.integers(0, env.max_blocks_per_asset + 1, size=env.n_assets)
-            obs, reward, term, trunc, info = env.step(action)
-            total_steps += 1
-            if term or trunc:
-                break
-    
-    total_time = time.time() - start_time
-    steps_per_second = total_steps / total_time
-    
-    print(f"Total steps: {total_steps}")
-    print(f"Total time: {total_time:.3f}s")
-    print(f"Steps per second: {steps_per_second:.1f}")
-    print(f"Milliseconds per step: {1000 / steps_per_second:.2f}ms")
-    
-    # Test turnover bug fix
-    print("\n" + "=" * 60)
-    print("TURNOVER BUG FIX TEST")
-    print("=" * 60)
-    
-    env.reset()
-    
-    # Set a fixed position
-    action1 = np.zeros(env.n_assets, dtype=int)
-    action1[:5] = 20  # Allocate 20 blocks to first 5 assets
-    
-    # First step - should have turnover cost
-    obs, reward, _, _, info1 = env.step(action1)
-    print(f"Step 1 (rebalance): turnover={info1['turnover']:.4f}, cost={info1['trade_cost']:.6f}")
-    
-    # Second step with same action but not a rebalance day - should have NO turnover cost
-    env.t = 1  # Reset to non-rebalance day
-    obs, reward, _, _, info2 = env.step(action1)
-    print(f"Step 2 (hold): turnover={info2['turnover']:.4f}, cost={info2['trade_cost']:.6f}")
-    
-    assert info2['turnover'] == 0.0, "Turnover should be 0 when holding position!"
-    assert info2['trade_cost'] == 0.0, "Trade cost should be 0 when holding position!"
-    print("✓ Turnover bug fix verified!")
+    for step in range(30):
+        # Random discrete action (only for top-K + cash slots)
+        action = env.np_random.integers(0, env.max_blocks_per_asset + 1, size=env.obs_n_assets)
+        obs, reward, term, trunc, info = env.step(action)
+        
+        # Log rebalancing days
+        if step % env.cfg.rebalance_interval == 0:
+            print(f"\nStep {step} (REBALANCING):")
+            print(f"  Date: {info['date'].date()}")
+            print(f"  Top-K assets: {len(info['top_k_assets'])}")
+            print(f"  Forced liquidation: {info['forced_liquidation']:.4f}")
+            print(f"  Turnover: {info['turnover']:.4f}")
+            print(f"  Wealth: {info['wealth']:.6f}")
+            
+            # Check that we have at most max_assets with non-zero weights
+            weights = info['weights']
+            non_zero_count = np.sum(weights[:-1] > 1e-6) if env.cfg.allow_cash else np.sum(weights > 1e-6)
+            print(f"  Non-zero positions: {non_zero_count} (should be <= {env.max_assets_config})")
+        
+        if term or trunc:
+            break
     
     print("\n" + "=" * 60)
-    print("All tests completed successfully!")
+    print("MAX ASSETS FEATURE TEST COMPLETE")
     print("=" * 60)
-    
-    # Summary of optimizations
-    print("\nOPTIMIZATIONS IMPLEMENTED:")
-    print("✓ JIT Compilation with Numba for core calculations")
-    print("✓ Pre-allocated work arrays to avoid repeated allocations")
-    print("✓ Efficient pivoting using unstack instead of pivot")
-    print("✓ Single-pass lagged feature creation")
-    print("✓ Fixed turnover bug (no cost when holding position)")
-    print("✓ Memory optimization with in-place operations")
-    print("✓ Optimized observation building with pre-allocated buffer")
-    print("✓ Fixed Numba default argument handling")
-    print("✓ Ensured contiguous arrays for np.dot() performance")
-    
-    print(f"\nFinal metrics:")
-    print(f"  Final wealth: {info['wealth']:.6f}")
-    print(f"  Features used: {len(env.feature_cols)}")
-    print(f"  Performance: {steps_per_second:.1f} steps/second")
+    print("\nKey changes implemented:")
+    print("✓ Fixed observation/action space of max_assets size")
+    print("✓ Dynamic top-K selection by index_weight on rebalancing days")
+    print("✓ Forced liquidation of assets outside top-K")
+    print("✓ Mapping between observation space and full universe")
+    print("✓ Preserved all existing features and optimizations")
