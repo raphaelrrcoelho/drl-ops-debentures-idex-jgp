@@ -423,9 +423,15 @@ def run_sensitivity_analysis(model_path: str, test_panel: pd.DataFrame,
         vecnorm_path = os.path.join(results_dir, "..", "models", strategy_label.split("_")[0].lower(), 
                                     "ppo", f"vecnorm_fold_{fold}_seed_{seed}.pkl")
         if os.path.exists(vecnorm_path):
-            venv = VecNormalize.load(vecnorm_path, venv)
+            import pickle
+            with open(vecnorm_path, 'rb') as f:
+                vecnorm_stats = pickle.load(f)
+            
+            venv = VecNormalize(venv, norm_obs=True, norm_reward=False)
+            venv.obs_rms = vecnorm_stats['obs_rms']
+            venv.ret_rms = vecnorm_stats['ret_rms']
+            venv.gamma = vecnorm_stats['gamma']
             venv.training = False
-            venv.norm_reward = False
 
         device = "cpu"
         model = MaskablePPO.load(model_path, device=device)
@@ -675,7 +681,15 @@ def main():
             # Load VecNormalize if available
             vecnorm_path = os.path.join(models_dir, f"vecnorm_fold_{fold}_seed_{seed}.pkl")
             if os.path.exists(vecnorm_path):
-                venv = VecNormalize.load(vecnorm_path, venv)
+                import pickle
+                with open(vecnorm_path, 'rb') as f:
+                    vecnorm_stats = pickle.load(f)
+                
+                # Create VecNormalize with the loaded statistics
+                venv = VecNormalize(venv, norm_obs=True, norm_reward=False)
+                venv.obs_rms = vecnorm_stats['obs_rms']
+                venv.ret_rms = vecnorm_stats['ret_rms']
+                venv.gamma = vecnorm_stats['gamma']
                 venv.training = False
                 venv.norm_reward = False
 

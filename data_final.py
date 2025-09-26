@@ -1,18 +1,16 @@
 # data_final.py
 """
-Enhanced Data preparation for CDI debenture universe with advanced feature engineering
-=====================================================================================
+Enhanced Data preparation for CDI debenture universe with CORRECTED return calculations
+========================================================================================
 
-Key Enhancements:
-1. Momentum/Reversal features at multiple horizons (1, 5, 20, 60 days)
-2. Volatility features (rolling std at 5, 20, 60 days) for returns and spreads
-3. Relative value features (spread vs sector median/mean, percentile ranks)
-4. Duration-based risk measures (duration changes, duration×spread interactions)
-5. Microstructure proxies (using index_weight as liquidity proxy)
-6. Enhanced carry features (carry momentum, carry/spread ratio)
-7. Spread dynamics (spread momentum, mean reversion, term structure)
-8. Cross-sectional features within sectors
-9. Risk-adjusted momentum (Sharpe-like ratios over rolling windows)
+CRITICAL FIX: IDEX CDI returns are SPREAD-ONLY (credit spread above CDI)
+- MTM and Carry are the credit spread components
+- Must add risk-free (CDI) to get total returns
+- Features are calculated on appropriate components:
+  * Momentum/Reversal: Based on MTM (price changes)
+  * Carry features: Based on carry component
+  * Volatility: Separate for MTM and total returns
+  * Risk-adjusted: Using total returns with RF
 
 All features maintain strict causality with lag-1 versions for policy inputs.
 """
@@ -66,6 +64,8 @@ REQUIRED_COLS = [
 
 OPTIONAL_KEEP = [
     "rating", "index_weight", "issuer", "sector",
+    # Core return components (NEW)
+    "mtm_return", "carry_return", "spread_return", "total_return",
     # ANBIMA sector curve features
     "sector_ns_beta0", "ns_beta1_common", "ns_lambda_common",
     "sector_fitted_spread", "spread_residual_ns",
@@ -73,11 +73,12 @@ OPTIONAL_KEEP = [
     # New features (will be added below)
     "ttm_rank", "excess_return", "sector_weight_index", "sector_spread_avg", 
     "sector_spread", "sector_momentum",
-    # Momentum features
-    *[f"momentum_{w}d" for w in MOMENTUM_WINDOWS],
-    *[f"reversal_{w}d" for w in MOMENTUM_WINDOWS],
-    # Volatility features
-    *[f"volatility_{w}d" for w in VOLATILITY_WINDOWS],
+    # MTM-based momentum features (price changes)
+    *[f"mtm_momentum_{w}d" for w in MOMENTUM_WINDOWS],
+    *[f"mtm_reversal_{w}d" for w in MOMENTUM_WINDOWS],
+    # Volatility features (MTM and total)
+    *[f"mtm_volatility_{w}d" for w in VOLATILITY_WINDOWS],
+    *[f"total_volatility_{w}d" for w in VOLATILITY_WINDOWS],
     *[f"spread_vol_{w}d" for w in VOLATILITY_WINDOWS],
     # Relative value features
     "spread_vs_sector_median", "spread_vs_sector_mean",
@@ -87,12 +88,12 @@ OPTIONAL_KEEP = [
     "modified_duration_proxy", "convexity_proxy",
     # Microstructure features
     "liquidity_score", "weight_momentum", "weight_volatility",
-    # Carry features
+    # Carry features (based on carry component)
     "carry_spread_ratio", "carry_momentum", "carry_vol",
     # Spread dynamics
     "spread_momentum_5d", "spread_momentum_20d",
     "spread_mean_reversion", "spread_acceleration",
-    # Risk-adjusted features
+    # Risk-adjusted features (using total returns)
     "sharpe_5d", "sharpe_20d", "sharpe_60d",
     "information_ratio_20d",
 ]
@@ -134,6 +135,7 @@ def _normalize_columns(df: pd.DataFrame, universe: str) -> pd.DataFrame:
         "Número": "number",
         "Numero": "number",
         "Rating": "rating",
+        "Número Índice": "index_value",
     }
     df = df.rename(columns=rename)
 
@@ -148,7 +150,7 @@ def _normalize_columns(df: pd.DataFrame, universe: str) -> pd.DataFrame:
         df["debenture_id"] = df["debenture_id"].astype(str)
 
     # Convert percentages to decimals
-    pct_cols = ["index_weight", "weighted_mtm", "weighted_return", "weighted_carry"]
+    pct_cols = ["index_weight", "weighted_mtm", "weighted_return", "weighted_carry", "index_value"]
     for c in pct_cols:
         if c in df.columns:
             if df[c].dtype == object:
@@ -182,42 +184,52 @@ def _normalize_columns(df: pd.DataFrame, universe: str) -> pd.DataFrame:
     return df
 
 
-# --- Enhanced Feature Engineering Functions ---
+# --- Enhanced Feature Engineering Functions (CORRECTED) ---
 
-def _compute_momentum_features(df: pd.DataFrame, windows: List[int] = MOMENTUM_WINDOWS) -> pd.DataFrame:
+def _compute_mtm_momentum_features(df: pd.DataFrame, windows: List[int] = MOMENTUM_WINDOWS) -> pd.DataFrame:
     """
-    Compute momentum and reversal features at multiple horizons.
-    Momentum is cumulative return over window, reversal is -1 * momentum.
+    Compute momentum and reversal features based on MTM returns (price changes).
+    MTM captures the price appreciation/depreciation component.
     """
     df = df.sort_values(["debenture_id", "date"]).copy()
     
+    # Use MTM returns for momentum
     for w in windows:
         # Use transform to maintain index alignment
-        df[f"momentum_{w}d"] = df.groupby("debenture_id", sort=False)["return"].transform(
+        df[f"mtm_momentum_{w}d"] = df.groupby("debenture_id", sort=False)["mtm_return"].transform(
             lambda x: (1 + x).rolling(w, min_periods=max(1, w//2)).apply(
                 lambda y: y.prod() - 1 if len(y) > 0 else 0, raw=True
             )
         ).astype(np.float32)
         
         # Reversal signal (inverse of momentum)
-        df[f"reversal_{w}d"] = -df[f"momentum_{w}d"]
+        df[f"mtm_reversal_{w}d"] = -df[f"mtm_momentum_{w}d"]
     
     return df
 
 
 def _compute_volatility_features(df: pd.DataFrame, windows: List[int] = VOLATILITY_WINDOWS) -> pd.DataFrame:
     """
-    Compute rolling volatility of returns and spreads.
+    Compute rolling volatility of MTM returns, total returns, and spreads.
     """
     df = df.sort_values(["debenture_id", "date"]).copy()
     
     for w in windows:
-        # Return volatility (annualized)
-        df[f"volatility_{w}d"] = (
-            df.groupby("debenture_id", sort=False)["return"].transform(
-                lambda x: x.rolling(w, min_periods=max(2, w//3)).std()
-            ) * np.sqrt(TRADING_DAYS_PER_YEAR)
-        ).astype(np.float32)
+        # MTM volatility (price volatility)
+        if "mtm_return" in df.columns:
+            df[f"mtm_volatility_{w}d"] = (
+                df.groupby("debenture_id", sort=False)["mtm_return"].transform(
+                    lambda x: x.rolling(w, min_periods=max(2, w//3)).std()
+                ) * np.sqrt(TRADING_DAYS_PER_YEAR)
+            ).astype(np.float32)
+        
+        # Total return volatility (includes carry and RF)
+        if "total_return" in df.columns:
+            df[f"total_volatility_{w}d"] = (
+                df.groupby("debenture_id", sort=False)["total_return"].transform(
+                    lambda x: x.rolling(w, min_periods=max(2, w//3)).std()
+                ) * np.sqrt(TRADING_DAYS_PER_YEAR)
+            ).astype(np.float32)
         
         # Spread volatility
         df[f"spread_vol_{w}d"] = df.groupby("debenture_id", sort=False)["spread"].transform(
@@ -287,20 +299,16 @@ def _compute_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _compute_carry_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Enhanced carry features using weighted_carry column.
+    Enhanced carry features using the actual carry component.
     """
-    if "weighted_carry" not in df.columns:
-        # If no carry data, create synthetic carry from spread
+    df = df.sort_values(["debenture_id", "date"]).copy()
+    
+    # Use the actual carry return if available
+    if "carry_return" not in df.columns:
+        # Fallback: use spread as proxy
         df["carry_proxy"] = df["spread"] * df.get("index_weight", 1.0)
     else:
-        # Normalize carry by index weight to get per-bond carry
-        df["carry_proxy"] = np.where(
-            df["index_weight"] > 0,
-            df["weighted_carry"] / df["index_weight"],
-            df["weighted_carry"]
-        )
-    
-    df = df.sort_values(["debenture_id", "date"]).copy()
+        df["carry_proxy"] = df["carry_return"]
     
     # Carry/Spread ratio (attractiveness measure)
     df["carry_spread_ratio"] = np.where(
@@ -347,13 +355,13 @@ def _compute_spread_dynamics(df: pd.DataFrame) -> pd.DataFrame:
 
 def _compute_risk_adjusted_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute Sharpe ratios and information ratios over rolling windows.
+    Compute Sharpe ratios and information ratios using TOTAL returns.
     """
     df = df.sort_values(["debenture_id", "date"]).copy()
     
-    # Ensure excess_return exists
-    if "excess_return" not in df.columns:
-        df["excess_return"] = df["return"] - df.get("risk_free", 0.0)
+    # Ensure excess_return exists (using total returns)
+    if "excess_return" not in df.columns and "total_return" in df.columns:
+        df["excess_return"] = df["total_return"] - df.get("risk_free", 0.0)
     
     # Sharpe ratios at different horizons using transform only
     for w in [5, 20, 60]:
@@ -361,7 +369,7 @@ def _compute_risk_adjusted_features(df: pd.DataFrame) -> pd.DataFrame:
         mean_excess = df.groupby("debenture_id", sort=False)["excess_return"].transform(
             lambda x: x.rolling(w, min_periods=max(2, w//3)).mean()
         )
-        std_returns = df.groupby("debenture_id", sort=False)["return"].transform(
+        std_returns = df.groupby("debenture_id", sort=False)["total_return"].transform(
             lambda x: x.rolling(w, min_periods=max(2, w//3)).std()
         )
         
@@ -372,24 +380,25 @@ def _compute_risk_adjusted_features(df: pd.DataFrame) -> pd.DataFrame:
         ).astype(np.float32)
     
     # Information ratio (vs index)
-    # Create active return column temporarily
-    df["active_return_temp"] = df["return"] - df["index_return"]
-    
-    mean_active = df.groupby("debenture_id", sort=False)["active_return_temp"].transform(
-        lambda x: x.rolling(20, min_periods=5).mean()
-    )
-    std_active = df.groupby("debenture_id", sort=False)["active_return_temp"].transform(
-        lambda x: x.rolling(20, min_periods=5).std()
-    )
-    
-    df["information_ratio_20d"] = np.where(
-        std_active > 0,
-        mean_active / std_active * np.sqrt(TRADING_DAYS_PER_YEAR),
-        0.0
-    ).astype(np.float32)
-    
-    # Clean up temporary column
-    df = df.drop(columns=["active_return_temp"], errors='ignore')
+    if "index_return" in df.columns:
+        # Create active return column temporarily (using total returns)
+        df["active_return_temp"] = df["total_return"] - df["index_return"]
+        
+        mean_active = df.groupby("debenture_id", sort=False)["active_return_temp"].transform(
+            lambda x: x.rolling(20, min_periods=5).mean()
+        )
+        std_active = df.groupby("debenture_id", sort=False)["active_return_temp"].transform(
+            lambda x: x.rolling(20, min_periods=5).std()
+        )
+        
+        df["information_ratio_20d"] = np.where(
+            std_active > 0,
+            mean_active / std_active * np.sqrt(TRADING_DAYS_PER_YEAR),
+            0.0
+        ).astype(np.float32)
+        
+        # Clean up temporary column
+        df = df.drop(columns=["active_return_temp"], errors='ignore')
     
     return df
 
@@ -434,8 +443,6 @@ def _compute_relative_value_features(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].fillna(0).astype(np.float32)
     
     return df
-
-
 
 
 # --- X-sec transforms (unchanged from original) ---
@@ -615,46 +622,102 @@ def _build_complete_panel(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_per_asset_returns(df: pd.DataFrame) -> pd.DataFrame:
-    """Approx per-asset daily return from weighted components if present."""
+    """
+    CRITICAL: Compute per-asset SPREAD returns from weighted components.
+    Then add risk-free to get TOTAL returns.
+    """
     df = df.sort_values(["debenture_id", "date"]).copy()
+    
     if not {"weighted_mtm", "weighted_carry", "index_weight"}.issubset(df.columns):
+        # If components not available, use return if exists
         if "return" not in df.columns:
             df["return"] = 0.0
+            df["mtm_return"] = 0.0
+            df["carry_return"] = 0.0
+            df["spread_return"] = 0.0
         return df
 
+    # Extract components
     w = df["index_weight"].to_numpy(dtype=np.float32)
     mtm = df["weighted_mtm"].to_numpy(dtype=np.float32)
     carry = df["weighted_carry"].to_numpy(dtype=np.float32)
     active = (w > 0.0)
-    ret = np.zeros_like(w, dtype=np.float32)
+    
+    # Calculate per-asset components
+    mtm_ret = np.zeros_like(w, dtype=np.float32)
+    carry_ret = np.zeros_like(w, dtype=np.float32)
+    
     with np.errstate(divide="ignore", invalid="ignore"):
-        ret[active] = (mtm[active] + carry[active]) / np.maximum(w[active], 1e-12)
-    df["return"] = np.where(np.isfinite(ret), ret, 0.0).astype(np.float32)
+        mtm_ret[active] = mtm[active] / np.maximum(w[active], 1e-12)
+        carry_ret[active] = carry[active] / np.maximum(w[active], 1e-12)
+    
+    # Store components
+    df["mtm_return"] = np.where(np.isfinite(mtm_ret), mtm_ret, 0.0).astype(np.float32)
+    df["carry_return"] = np.where(np.isfinite(carry_ret), carry_ret, 0.0).astype(np.float32)
+    
+    # Spread return (MTM + Carry)
+    df["spread_return"] = df["mtm_return"] + df["carry_return"]
+    
+    # CRITICAL: This is still SPREAD-ONLY, not total return
+    # Total return will be computed after attaching risk-free
+    df["return"] = df["spread_return"]  # Temporarily store spread return
+    
     return df
 
 
 def _attach_benchmark(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute index_return from index_level (date-level) and broadcast."""
-    if "index_level" not in df.columns:
-        df["index_level"] = np.nan
-    idx_series = (
-        df[["date", "index_level"]]
-        .dropna()
-        .drop_duplicates(subset=["date"], keep="first")
-        .set_index("date")["index_level"]
-        .sort_index()
-    )
-    idx_ret = idx_series.pct_change().fillna(0.0)
+    """
+    Compute index_return from index_value (the spread index).
+    Note: This is SPREAD-ONLY index return.
+    """
+    # First preserve index_level from original dataframe if it exists
+    index_level_series = None
+    if "index_level" in df.columns:
+        index_level_series = (
+            df[["date", "index_level"]]
+            .dropna()
+            .drop_duplicates(subset=["date"], keep="first")
+            .set_index("date")["index_level"]
+            .sort_index()
+        )
+    
+    # Calculate index_return
+    if "index_value" in df.columns:
+        # Use index_value if available (from Número Índice column)
+        idx_series = (
+            df[["date", "index_value"]]
+            .dropna()
+            .drop_duplicates(subset=["date"], keep="first")
+            .set_index("date")["index_value"]
+            .sort_index()
+        )
+        # The index_value is already the daily return (it's the sum of weighted spreads)
+        idx_ret = idx_series
+    elif index_level_series is not None and not index_level_series.empty:
+        # Fallback to index_level if no index_value
+        idx_ret = index_level_series.pct_change().fillna(0.0)
+    else:
+        # No index data available
+        idx_ret = pd.Series(0.0, index=df["date"].unique().sort_values())
+    
     df = df.merge(idx_ret.rename("index_return").reset_index(), on="date", how="left")
     df["index_return"] = df["index_return"].fillna(0.0).astype(np.float32)
 
-    df = df.merge(idx_series.rename("_idxlvl").reset_index(), on="date", how="left")
-    df["index_level"] = _safe_float(df["index_level"]).fillna(df.pop("_idxlvl")).astype(np.float32)
+    # Restore index_level to the dataframe
+    if index_level_series is not None and not index_level_series.empty:
+        df = df.merge(index_level_series.rename("index_level").reset_index(), on="date", how="left")
+        df["index_level"] = df["index_level"].fillna(method='ffill').fillna(0.0).astype(np.float32)
+    elif "index_level" not in df.columns:
+        # Create a dummy index_level if none exists
+        df["index_level"] = 1000.0  # Default value
+    
     return df
 
 
 def _attach_risk_free(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """Attach risk_free daily from SGS."""
+    """
+    Attach risk_free daily from SGS and compute TOTAL returns.
+    """
     if df.empty:
         return df, {"source": "none"}
 
@@ -697,6 +760,16 @@ def _attach_risk_free(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
     
     df["risk_free"] = df["risk_free"].fillna(0.0).astype(np.float32)
     
+    # CRITICAL: Now compute TOTAL returns by adding risk-free to spread returns
+    if "spread_return" in df.columns:
+        df["total_return"] = (df["spread_return"] + df["risk_free"]).astype(np.float32)
+        # Update the main return column to be total return
+        df["return"] = df["total_return"]
+    
+    # Also update index return to include risk-free (it's also spread-only)
+    if "index_return" in df.columns:
+        df["index_return"] = (df["index_return"] + df["risk_free"]).astype(np.float32)
+    
     return df, rf_info
 
 
@@ -723,11 +796,15 @@ def _basic_features(df: pd.DataFrame) -> pd.DataFrame:
         df["ttm_rank"] = 0.0
         df.loc[mask, "ttm_rank"] = ttm_rank.astype(np.float32)
 
-    if "return" in df.columns:
-        if "risk_free" in df.columns:
-            df["excess_return"] = (df["return"] - df["risk_free"]).astype("float32")
-        else:
-            df["excess_return"] = np.float32(0.0)
+    # Excess return using TOTAL returns
+    if "total_return" in df.columns:
+        df["excess_return"] = (df["total_return"] - df["risk_free"]).astype("float32")
+    elif "return" in df.columns:
+        # Fallback if total_return not computed yet
+        df["excess_return"] = (df["return"] - df["risk_free"]).astype("float32")
+    else:
+        df["excess_return"] = np.float32(0.0)
+    
     return df
 
 
@@ -977,7 +1054,9 @@ def _apply_sector_curves_anbima(panel: pd.DataFrame, use_anchor: bool = True) ->
 
 def _final_tidy_types(df: pd.DataFrame) -> pd.DataFrame:
     """Keep required, optional, and engineered features."""
-    keep = set(REQUIRED_COLS) | {c for c in OPTIONAL_KEEP if c in df.columns}
+    # Include all return components
+    keep = set(REQUIRED_COLS) | {"mtm_return", "carry_return", "spread_return", "total_return"}
+    keep |= {c for c in OPTIONAL_KEEP if c in df.columns}
     pattern_cols = [c for c in df.columns if c.endswith("_lag1") or c.endswith("_z") or "_z" in c]
     keep |= set(pattern_cols)
 
@@ -1019,6 +1098,7 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
     pnl = _attach_benchmark(pnl)
 
     # Risk-free (online) + provenance
+    # CRITICAL: This also computes total returns
     pnl, rf_info = _attach_risk_free(pnl)
 
     # Basic features
@@ -1027,13 +1107,13 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
     # Sector signals
     pnl = _sector_signals(pnl, momentum_window=63)
 
-    # === ENHANCED FEATURE ENGINEERING ===
+    # === ENHANCED FEATURE ENGINEERING (CORRECTED) ===
     
-    # 1. Momentum/Reversal features
-    print("[INFO] Computing momentum/reversal features...")
-    pnl = _compute_momentum_features(pnl, windows=MOMENTUM_WINDOWS)
+    # 1. MTM-based Momentum/Reversal features
+    print("[INFO] Computing MTM momentum/reversal features...")
+    pnl = _compute_mtm_momentum_features(pnl, windows=MOMENTUM_WINDOWS)
     
-    # 2. Volatility features
+    # 2. Volatility features (MTM and total)
     print("[INFO] Computing volatility features...")
     pnl = _compute_volatility_features(pnl, windows=VOLATILITY_WINDOWS)
     
@@ -1057,7 +1137,7 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
     print("[INFO] Computing spread dynamics...")
     pnl = _compute_spread_dynamics(pnl)
     
-    # 8. Risk-adjusted features
+    # 8. Risk-adjusted features (using total returns)
     print("[INFO] Computing risk-adjusted features...")
     pnl = _compute_risk_adjusted_features(pnl)
 
@@ -1077,10 +1157,13 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
         "sector_fitted_spread", "spread_residual_ns",
         "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y",
         "index_level", "index_weight",
+        # Return components
+        "mtm_return", "carry_return", "spread_return", "total_return",
         # New features
-        *[f"momentum_{w}d" for w in MOMENTUM_WINDOWS],
-        *[f"reversal_{w}d" for w in MOMENTUM_WINDOWS],
-        *[f"volatility_{w}d" for w in VOLATILITY_WINDOWS],
+        *[f"mtm_momentum_{w}d" for w in MOMENTUM_WINDOWS],
+        *[f"mtm_reversal_{w}d" for w in MOMENTUM_WINDOWS],
+        *[f"mtm_volatility_{w}d" for w in VOLATILITY_WINDOWS],
+        *[f"total_volatility_{w}d" for w in VOLATILITY_WINDOWS],
         *[f"spread_vol_{w}d" for w in VOLATILITY_WINDOWS],
         "spread_vs_sector_median", "spread_vs_sector_mean",
         "spread_percentile_sector", "spread_percentile_all",
@@ -1113,10 +1196,6 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
     print("[INFO] Computing rolling z-scores...")
     pnl = _zscore_ts_rolling_past_only(pnl, cont_features, window=252)
 
-    # Diagnostics
-    if "excess_return" not in pnl.columns and {"return", "risk_free"}.issubset(pnl.columns):
-        pnl["excess_return"] = (pnl["return"] - pnl["risk_free"]).astype("float32")
-
     # ---------------------------------------------------------------------
     # Create lag-1 versions of all features (strictly causal)
     # ---------------------------------------------------------------------
@@ -1130,10 +1209,13 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
         "sector_fitted_spread", "spread_residual_ns",
         "sector_ns_level_1y", "sector_ns_level_3y", "sector_ns_level_5y",
         "index_level",
+        # All return components
+        "mtm_return", "carry_return", "spread_return", "total_return",
         # All new features
-        *[f"momentum_{w}d" for w in MOMENTUM_WINDOWS],
-        *[f"reversal_{w}d" for w in MOMENTUM_WINDOWS],
-        *[f"volatility_{w}d" for w in VOLATILITY_WINDOWS],
+        *[f"mtm_momentum_{w}d" for w in MOMENTUM_WINDOWS],
+        *[f"mtm_reversal_{w}d" for w in MOMENTUM_WINDOWS],
+        *[f"mtm_volatility_{w}d" for w in VOLATILITY_WINDOWS],
+        *[f"total_volatility_{w}d" for w in VOLATILITY_WINDOWS],
         *[f"spread_vol_{w}d" for w in VOLATILITY_WINDOWS],
         "spread_vs_sector_median", "spread_vs_sector_mean",
         "spread_percentile_sector", "spread_percentile_all",
@@ -1216,7 +1298,7 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
                 "momentum_windows": MOMENTUM_WINDOWS,
                 "volatility_windows": VOLATILITY_WINDOWS,
                 "feature_groups": [
-                    "momentum_reversal",
+                    "mtm_momentum_reversal",
                     "volatility",
                     "relative_value",
                     "duration_risk",
@@ -1226,6 +1308,15 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
                     "risk_adjusted",
                     "sector_curves"
                 ]
+            },
+            "return_structure": {
+                "mtm_return": "Price change component (spread-only)",
+                "carry_return": "Carry component (spread-only)",
+                "spread_return": "MTM + Carry (spread-only)",
+                "risk_free": "CDI daily rate",
+                "total_return": "Spread + CDI (complete return)",
+                "index_return": "Index spread + CDI (complete return)",
+                "return": "Alias for total_return (complete)"
             },
             "trading_days_per_year": TRADING_DAYS_PER_YEAR,
             "short_end_exclusion_bd": BUSINESS_DAYS_SHORT_DROP,
@@ -1254,6 +1345,17 @@ def process_universe(universe: str, data_dir: str = "data") -> Optional[pd.DataF
     print(f"Z-score features (_z): {len([c for c in final.columns if c.endswith('_z')])}")
     print(f"Rolling z-scores (_z252): {len([c for c in final.columns if '_z252' in c])}")
     
+    # Check return magnitudes
+    if "total_return" in final.columns:
+        total_ret_mean = final["total_return"].mean()
+        spread_ret_mean = final["spread_return"].mean() if "spread_return" in final.columns else 0
+        rf_mean = final["risk_free"].mean()
+        print(f"\n[RETURN VERIFICATION]")
+        print(f"Mean daily total return: {total_ret_mean*100:.4f}%")
+        print(f"Mean daily spread return: {spread_ret_mean*100:.4f}%")
+        print(f"Mean daily risk-free: {rf_mean*100:.4f}%")
+        print(f"Total = Spread + RF? {abs(total_ret_mean - (spread_ret_mean + rf_mean)) < 1e-6}")
+    
     return final
 
 
@@ -1262,13 +1364,13 @@ def prepare_data(data_dir: str = "data"):
     os.makedirs(data_dir, exist_ok=True)
     
     print("\n" + "="*60)
-    print("ENHANCED DATA PREPARATION WITH ADVANCED FEATURES")
+    print("ENHANCED DATA PREPARATION WITH CORRECTED RETURNS")
     print("="*60 + "\n")
     
     cdi = process_universe("cdi", data_dir)
     
     if cdi is not None:
-        print(f"\n[SUCCESS] CDI universe processed with features")
+        print(f"\n[SUCCESS] CDI universe processed with corrected returns")
     
     print("\nData preparation complete.")
     return cdi
