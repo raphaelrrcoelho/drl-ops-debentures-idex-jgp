@@ -79,7 +79,7 @@ def append_long_csv(path: str, df_new: pd.DataFrame, sort_by: Optional[List[str]
 
 REQUIRED_COLS = [
     "return", "spread", "duration", "sector_id", "active",
-    "risk_free", "index_return", "time_to_maturity", "index_level", 
+    "risk_free", "index_return", "time_to_maturity", 
     "index_weight",  # Now required for top-K selection
 ]
 
@@ -110,7 +110,7 @@ ENHANCED_FEATURE_GROUPS = {
 }
 
 SAFE_FILL_0 = ["return", "spread", "duration", "time_to_maturity", "ttm_rank"]
-DATE_LEVEL = ["risk_free", "index_return", "index_level"]
+DATE_LEVEL = ["risk_free", "index_return"]
 
 def _date_level_map(panel: pd.DataFrame, col: str) -> pd.Series:
     """First value per date; used to broadcast date-level series."""
@@ -266,9 +266,6 @@ def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str],
     for name in ["risk_free", "index_return"]:
         test_aug[name] = test_aug[name].astype(np.float32).fillna(0.0)
 
-    if "index_level" in test_aug.columns:
-        test_aug["index_level"] = test_aug["index_level"].astype(float).ffill().fillna(0.0)
-
     # Fill enhanced features with 0 if missing
     for feat in lagged_features:
         if feat in test_aug.columns:
@@ -294,38 +291,70 @@ def max_drawdown(wealth: pd.Series) -> float:
     dd = wealth / peak - 1.0
     return float(dd.min())
 
-def compute_metrics(returns: pd.Series, rf: pd.Series, bench: pd.Series) -> Dict[str, float]:
+def compute_metrics(returns: pd.Series, rf: pd.Series, bench: pd.Series,
+                    periods: int = int(TRADING_DAYS)) -> Dict[str, float]:
     """
     Calculate performance metrics consistent with baselines.
+    NOTE: returns are already TOTAL returns (including RF)
     """
     r = returns.fillna(0.0).astype(float)
     rf_a = rf.reindex(r.index).fillna(0.0).astype(float)
     bench_a = bench.reindex(r.index).fillna(0.0).astype(float)
 
-    r_ex = r - rf_a
+    r_excess = (r - rf_a).fillna(0.0)
+    r_rel = (r - bench_a).fillna(0.0)
+
     mu = r.mean()
     sd = r.std(ddof=1)
-    mu_ex = r_ex.mean()
-    sd_ex = r_ex.std(ddof=1)
-    down = r_ex[r_ex < 0.0].std(ddof=1)
+    mu_ex = r_excess.mean()
+    sd_ex = r_excess.std(ddof=1)
+    downside = r_excess[r_excess < 0].std(ddof=1)
 
     sharpe_d = (mu_ex / sd_ex) if sd_ex > 0 else np.nan
-    sortino_d = (mu_ex / down) if down and down > 0 else np.nan
+    sortino_d = (mu_ex / downside) if downside and downside > 0 else np.nan
 
     wealth = wealth_from_returns(r)
     mdd = max_drawdown(wealth)
     n = max(1, len(r))
-    cagr = float(wealth.iloc[-1] ** (TRADING_DAYS / n) - 1.0)
-    vol_ann = float(sd * np.sqrt(TRADING_DAYS))
-    calmar = float(cagr / abs(mdd)) if mdd < 0 else np.nan
+    cagr = float(wealth.iloc[-1] ** (periods / n) - 1.0)
+    vol_ann = float(sd * np.sqrt(periods))
+    sharpe_ann = sharpe_d * np.sqrt(periods) if sharpe_d == sharpe_d else np.nan
+    sortino_ann = sortino_d * np.sqrt(periods) if sortino_d == sortino_d else np.nan
+    calmar = (cagr / abs(mdd)) if mdd < 0 else np.nan
+
+    # Additional metrics from baselines
+    cov = np.cov(r.dropna(), bench_a.reindex(r.index).dropna())[0, 1] if len(r.dropna()) and len(bench_a.dropna()) else np.nan
+    varb = bench_a.var(ddof=1)
+    beta = (cov / varb) if varb and varb > 0 else np.nan
+    alpha = (mu - bench_a.mean() * (beta if beta == beta else 0.0))
+
+    ir_den = r_rel.std(ddof=1)
+    information_ratio = (r_rel.mean() / ir_den) if ir_den and ir_den > 0 else np.nan
+
+    pos = bench_a > 0
+    neg = bench_a < 0
+    up_capture = (r[pos].mean() / bench_a[pos].mean()) if pos.any() and bench_a[pos].mean() != 0 else np.nan
+    down_capture = (r[neg].mean() / bench_a[neg].mean()) if neg.any() and bench_a[neg].mean() != 0 else np.nan
+
+    hit_rate = (r > 0).mean()
+    skew = r.skew()
+    kurt = r.kurt()
 
     return {
-        "CAGR": cagr,
-        "Vol_ann": vol_ann,
-        "Sharpe": sharpe_d * np.sqrt(TRADING_DAYS) if not np.isnan(sharpe_d) else np.nan,
-        "Sortino": sortino_d * np.sqrt(TRADING_DAYS) if not np.isnan(sortino_d) else np.nan,
-        "MaxDD": mdd,
-        "Calmar": calmar,
+        "CAGR": float(cagr),
+        "Vol_ann": float(vol_ann),
+        "Sharpe": float(sharpe_ann),
+        "Sortino": float(sortino_ann),
+        "MaxDD": float(mdd),
+        "Calmar": float(calmar),
+        "Alpha_daily": float(alpha),
+        "Beta": float(beta) if beta == beta else np.nan,
+        "Information_Ratio": float(information_ratio),
+        "Up_capture": float(up_capture),
+        "Down_capture": float(down_capture),
+        "Hit_rate": float(hit_rate),
+        "Skew": float(skew),
+        "Kurtosis": float(kurt),
     }
 
 # ------------------------- Weights serialization ------------------------- #
@@ -786,7 +815,9 @@ def main():
             row = {"strategy": label, "fold": fold, "seed": seed}
             row.update(m)
 
-            fold_cols = ["strategy", "fold", "seed", "CAGR", "Vol_ann", "Sharpe", "Sortino", "MaxDD", "Calmar"]
+            fold_cols = ["strategy", "fold", "seed", "CAGR", "Vol_ann", "Sharpe", "Sortino", 
+             "MaxDD", "Calmar", "Alpha_daily", "Beta", "Information_Ratio", 
+             "Up_capture", "Down_capture", "Hit_rate", "Skew", "Kurtosis"]
             append_row_csv(os.path.join(res_dir, "fold_metrics.csv"), row, cols_order=fold_cols)
             append_row_csv(os.path.join(res_dir, "all_metrics.csv"), row, cols_order=fold_cols)
 

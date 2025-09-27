@@ -93,10 +93,10 @@ def append_long_csv(path: str, df_new: pd.DataFrame, sort_by: Optional[List[str]
 
 REQUIRED_COLS = [
     "return", "spread", "duration", "sector_id", "active",
-    "risk_free", "index_return", "time_to_maturity", "index_level", "index_weight"
+    "risk_free", "index_return", "time_to_maturity", "index_weight"
 ]
 SAFE_FILL_0 = ["return", "spread", "duration", "time_to_maturity", "ttm_rank"]
-DATE_LEVEL = ["risk_free", "index_return", "index_level"]
+DATE_LEVEL = ["risk_free", "index_return"]
 
 def _date_level_map(panel: pd.DataFrame, col: str) -> pd.Series:
     if col not in panel.columns:
@@ -202,10 +202,6 @@ def build_eval_panel_with_union(panel: pd.DataFrame, fold_cfg: Dict[str, str], u
     for opt in ["rv_residual","sector_curve_slope","sector_curve_curv","ttm_rank"]:
         if opt in test_aug.columns:
             test_aug[opt] = test_aug[opt].fillna(0.0)
-
-    if "index_level" in test_aug.columns:
-        test_aug["index_level"] = test_aug["index_level"].astype(float).ffill()
-        test_aug["index_level"] = test_aug["index_level"].fillna(0.0)
 
     for name in ["risk_free", "index_return"]:
         test_aug[name] = test_aug[name].astype(np.float32).fillna(0.0)

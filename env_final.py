@@ -356,7 +356,7 @@ class DebentureTradingEnv(gym.Env):
         # Required columns check
         required = [
             "return", "risk_free", "index_return", "active",
-            "spread", "duration", "time_to_maturity", "sector_id", "index_level"
+            "spread", "duration", "time_to_maturity", "sector_id",
         ]
         
         # NEW: Also require index_weight for top-K selection
@@ -1099,7 +1099,6 @@ if __name__ == "__main__":
         test_panel["duration"] = rng.uniform(1.0, 5.0, size=len(test_panel)).astype(np.float32)
         test_panel["time_to_maturity"] = rng.uniform(0.5, 4.0, size=len(test_panel)).astype(np.float32)
         test_panel["sector_id"] = rng.integers(0, 3, size=len(test_panel)).astype(np.int16)
-        test_panel["index_level"] = 1000.0
         test_panel["active"] = 1
         
         # Add index_weight with some variation
