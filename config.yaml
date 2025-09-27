@@ -28,14 +28,14 @@ activation: tanh
 # Portfolio constraints
 rebalance_interval: 10
 max_weight: 0.10
-weight_blocks: 100  # For discrete action space (1% granularity)
+weight_blocks: 50  # For discrete action space (2% granularity)
 allow_cash: true
 cash_rate_as_rf: true
 on_inactive: to_cash  # or "pro_rata"
 
 # Transaction costs
-transaction_cost_bps: 20.0
-delist_extra_bps: 20.0  # Extra slippage on forced liquidation
+transaction_cost_bps: 10.0
+delist_extra_bps: 10.0  # Extra slippage on forced liquidation
 
 # Observation processing
 normalize_features: true
@@ -59,7 +59,7 @@ use_rolling_zscores: false
 weight_alpha: 1.0   # Weight for alpha (r - index)
 
 # Reward penalties
-lambda_turnover: 0.0002
+lambda_turnover: 0.01
 lambda_hhi: 0.01
 lambda_drawdown: 0.005
 lambda_tail: 0.001  # Set to 0 to disable tail risk penalty
