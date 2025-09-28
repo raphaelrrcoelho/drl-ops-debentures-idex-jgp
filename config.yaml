@@ -4,7 +4,7 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 40960  # Increased to be meaningful (multiple of n_steps)
+total_timesteps: 81920  # Increased to be meaningful (multiple of n_steps)
 learning_rate: 5.0e-5
 n_steps: 256       
 batch_size: 124
@@ -44,22 +44,22 @@ include_prev_weights: false
 include_active_flag: false
 global_stats: true
 use_momentum_features: true
-use_volatility_features: false
+use_volatility_features: true
 use_relative_value_features: true
 use_duration_features: true
-use_microstructure_features: false
+use_microstructure_features: true
 use_carry_features: true
 use_spread_dynamics: true
-use_risk_adjusted_features: false
+use_risk_adjusted_features: true
 use_sector_curves: true
-use_zscore_features: false
-use_rolling_zscores: false
+use_zscore_features: true
+use_rolling_zscores: true
 
 # Reward configuration
 weight_alpha: 1.0   # Weight for alpha (r - index)
 
 # Reward penalties
-lambda_turnover: 0.05
+lambda_turnover: 0.1
 lambda_hhi: 0.01
 lambda_drawdown: 0.01
 lambda_tail: 0.01  # Set to 0 to disable tail risk penalty

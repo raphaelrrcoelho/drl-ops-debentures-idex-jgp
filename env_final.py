@@ -538,7 +538,7 @@ class DebentureTradingEnv(gym.Env):
         self.IDX= np.nan_to_num(IDX.values.astype(np.float16).ravel(), nan=0.0)
         self.ACT = np.nan_to_num(A.values.astype(np.int8), nan=0).astype(np.int8)
         self.W = np.nan_to_num(W.values.astype(np.float32), nan=0.0)  # Index weights
-        self.X = np.nan_to_num(X.astype(np.float16), nan=0.0)
+        self.X = np.nan_to_num(X.astype(np.float32), nan=0.0)
 
         self.T = self.R.shape[0]
         self.F = self.X.shape[-1] if self.X.ndim == 3 else 0

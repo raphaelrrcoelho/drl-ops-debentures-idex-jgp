@@ -8,10 +8,10 @@ OPTIMIZED VERSION with memory-efficient top-K panel construction:
 3. HDF5 caching with densify/sparsify on I/O
 4. Removed deprecated/unused code paths
 
-NEW: True top-K panel construction that includes:
-- Assets currently in top-K by index_weight
-- Assets that will be in top-K at any rebalance point
-- No unnecessary assets that never enter top-K
+NEW FEATURES ADDED:
+- Progressive training with gradual complexity increase
+- Curriculum learning for different market conditions
+- Adaptive hyperparameter scheduling
 """
 from __future__ import annotations
 
@@ -97,6 +97,31 @@ class PPOConfig:
     net_arch: tuple = (256, 256)
     ortho_init: bool = True
     activation: str = "tanh"
+
+# NEW: Progressive Training Stage Configuration
+@dataclass
+class ProgressiveStage:
+    """Configuration for a progressive training stage"""
+    name: str
+    timesteps: int
+    transaction_cost_bps: float
+    delist_extra_bps: float
+    lambda_turnover: float
+    lambda_hhi: float
+    lambda_drawdown: float
+    learning_rate: float
+    ent_coef: float
+    clip_range: float
+    max_grad_norm: float
+
+# NEW: Market Regime Configuration
+@dataclass
+class MarketRegime:
+    """Configuration for curriculum learning market regime"""
+    name: str
+    volatility_percentile: Tuple[float, float]  # (min, max) percentile of volatility to include
+    trend_strength: Tuple[float, float]  # (min, max) trend strength
+    timesteps: int
 
 # Memory efficiency parameters
 SPARSE_THRESHOLD = 0.5  # Use sparse if >50% zeros/missing
@@ -320,43 +345,16 @@ def build_topk_panel(panel: pd.DataFrame,
         asset_mask = panel.index.get_level_values("debenture_id").isin(ever_topk_ids)
         train_subset = panel.loc[date_mask & asset_mask].copy()
         
-        # Create full index and reindex
-        full_idx = pd.MultiIndex.from_product(
-            [train_dates, ever_topk_ids],
-            names=["date", "debenture_id"]
-        )
-        train_aug = train_subset.reindex(full_idx).sort_index()
+        # Build complete date×asset grid
+        idx = pd.MultiIndex.from_product([train_dates, ever_topk_ids], names=["date", "debenture_id"])
+        train_aug = train_subset.reindex(idx).sort_index()
         
-        # Process missing values efficiently
-        fill_specs = [
-            ("active", 0, np.int8),
-            ("return", 0.0, np.float32),
-            ("spread", 0.0, np.float32),
-            ("duration", 0.0, np.float32),
-            ("time_to_maturity", 0.0, np.float32),
-            ("sector_id", -1, np.int16),
-            ("index_weight", 0.0, np.float32),
-        ]
+        # Safe fills
+        train_aug["active"] = train_aug["active"].fillna(0).astype(np.int8)
+        train_aug["return"] = np.where(train_aug["active"].astype(bool), train_aug["return"], 0.0)
+        train_aug["index_weight"] = train_aug["index_weight"].fillna(0.0)
         
-        for col, fill_val, dtype in fill_specs:
-            if col in train_aug.columns:
-                train_aug[col] = train_aug[col].fillna(fill_val).astype(dtype)
-        
-        # Broadcast date-level columns
-        date_cols = ["risk_free", "index_return", "index_level"]
-        date_maps = {}
-        for name in date_cols:
-            if name in panel.columns:
-                date_map = panel.groupby(level="date", sort=False)[name].first()
-                date_maps[name] = date_map
-        
-        if date_maps:
-            train_aug = train_aug.reset_index()
-            for name, mapping in date_maps.items():
-                train_aug[name] = train_aug["date"].map(mapping).astype(np.float32).fillna(0.0)
-            train_aug = train_aug.set_index(["date", "debenture_id"]).sort_index()
-        
-        # Check sparsity and convert if beneficial
+        # Sparsify columns with many zeros
         sparse_cols = []
         for col in train_aug.columns:
             if pd.api.types.is_numeric_dtype(train_aug[col]):
@@ -410,77 +408,40 @@ def ensure_dirs(*paths: str):
 
 def folds_from_dates(dates: pd.DatetimeIndex, n_folds: int = 9, embargo_days: int = 3) -> List[Dict[str, str]]:
     """Build expanding window folds."""
-    dates = pd.to_datetime(pd.Index(dates).unique().sort_values())
-    T = len(dates)
+    if len(dates) < 10:
+        raise ValueError(f"Not enough dates ({len(dates)}) to build {n_folds} folds.")
     
-    print(f"\n[FOLD CONSTRUCTION]")
-    print(f"  Total dates: {T} ({dates[0].date()} to {dates[-1].date()})")
-    print(f"  Number of folds: {n_folds}")
-    print(f"  Embargo days: {embargo_days}")
-    
-    if n_folds <= 1 or T < 10:
-        return [{
-            "fold": 0,
-            "train_start": str(dates[0].date()),
-            "train_end": str(dates[int(T * 0.7)].date()),
-            "test_start": str(dates[min(int(T * 0.7) + embargo_days, T - 1)].date()),
-            "test_end": str(dates[-1].date()),
-        }]
-    
-    cuts = np.linspace(0, T - 1, n_folds + 1, dtype=int)
+    dates_sorted = dates.sort_values()
+    T = len(dates_sorted)
+    test_size = T // n_folds
     folds = []
     
     for i in range(n_folds):
-        train_start = dates[0]
-        train_end_idx = max(int(T / (n_folds + 1)), 10) if i == 0 else cuts[i]
-        train_end = dates[min(train_end_idx, T - 1)]
+        test_start_idx = i * test_size
+        test_end_idx = (i + 1) * test_size if i < n_folds - 1 else T
+        train_end_idx = test_start_idx - embargo_days
         
-        test_start_idx = min(train_end_idx + embargo_days + 1, T - 1)
-        test_end_idx = cuts[i + 1] if i + 1 < len(cuts) else T - 1
-        test_start = dates[test_start_idx]
-        test_end = dates[test_end_idx]
-        
-        if test_start_idx >= test_end_idx or train_end_idx < 5:
+        if train_end_idx <= 0:
             continue
-            
-        fold = {
-            "fold": int(i),
-            "train_start": str(train_start.date()),
-            "train_end": str(train_end.date()),
-            "test_start": str(test_start.date()),
-            "test_end": str(test_end.date()),
-        }
-        folds.append(fold)
         
-        train_days = (train_end - train_start).days
-        test_days = (test_end - test_start).days
-        print(f"  Fold {i}: Train {train_days}d, Test {test_days}d")
+        folds.append({
+            "fold": str(i),
+            "train_start": str(dates_sorted[0].date()),
+            "train_end": str(dates_sorted[train_end_idx - 1].date()),
+            "test_start": str(dates_sorted[test_start_idx].date()),
+            "test_end": str(dates_sorted[test_end_idx - 1].date()),
+        })
     
     return folds
 
-# ---------------------- Wrappers for Discrete Actions ---------------------- #
+# ---------------------------- Wrappers ----------------------------- #
 
 def mask_fn(env: gym.Env) -> np.ndarray:
-    """Action mask function for MaskablePPO."""
-    if hasattr(env, 'get_action_masks'):
-        masks = env.get_action_masks()
-        if isinstance(masks, list):
-            total_size = sum(len(m) for m in masks)
-            result = np.empty(total_size, dtype=bool)
-            idx = 0
-            for m in masks:
-                size = len(m)
-                result[idx:idx+size] = m
-                idx += size
-            return result
-        return masks
-    else:
-        if hasattr(env, 'action_space') and hasattr(env.action_space, 'nvec'):
-            return np.ones(sum(env.action_space.nvec), dtype=bool)
-        return np.ones(100, dtype=bool)
+    """Return action mask from environment."""
+    return env.get_wrapper_attr("get_action_masks")()
 
 class SafeObsWrapper(gym.ObservationWrapper):
-    """Observation wrapper with NaN/Inf handling."""
+    """Observation wrapper with NaN/Inf handling and clipping."""
     def __init__(self, env, clip: float = 7.5):
         super().__init__(env)
         self._clip = float(clip)
@@ -579,6 +540,163 @@ class DetailedMetricsLoggerCallback(BaseCallback):
                 writer.writeheader()
             writer.writerow(rec)
 
+# NEW: Progressive Training Callback
+class ProgressiveTrainingCallback(BaseCallback):
+    """Handles progressive training stages"""
+    def __init__(self, stages: List[ProgressiveStage], verbose: int = 1):
+        super().__init__(verbose)
+        self.stages = stages
+        self.current_stage = 0
+        self.stage_timesteps = 0
+        self.total_timesteps_done = 0
+        
+    def _on_step(self) -> bool:
+        # Get number of environments from the model
+        n_envs = self.model.env.num_envs if hasattr(self.model, 'env') else 1
+        self.stage_timesteps += n_envs
+        self.total_timesteps_done += n_envs
+        
+        # Check if we should move to next stage
+        if self.current_stage < len(self.stages) - 1:
+            if self.stage_timesteps >= self.stages[self.current_stage].timesteps:
+                self._advance_stage()
+        
+        return True
+    
+    def _advance_stage(self):
+        self.current_stage += 1
+        self.stage_timesteps = 0
+        stage = self.stages[self.current_stage]
+        
+        if self.verbose > 0:
+            print(f"\n{'='*60}")
+            print(f"PROGRESSIVE TRAINING: Advancing to {stage.name}")
+            print(f"  Transaction costs: {stage.transaction_cost_bps} bps")
+            print(f"  Turnover penalty: {stage.lambda_turnover}")
+            print(f"  Learning rate: {stage.learning_rate:.2e}")
+            print(f"  Entropy: {stage.ent_coef}")
+            print(f"{'='*60}\n")
+        
+        # Update environment parameters
+        # Access the actual environments through the vectorized environment
+        vec_env = self.model.env
+        # For DummyVecEnv or SubprocVecEnv wrapped in VecNormalize
+        if hasattr(vec_env, 'venv'):
+            actual_vec_env = vec_env.venv
+        else:
+            actual_vec_env = vec_env
+            
+        # Update each environment
+        if hasattr(actual_vec_env, 'envs'):
+            for env in actual_vec_env.envs:
+                # Navigate through wrappers to get base environment
+                base_env = env
+                while hasattr(base_env, 'env'):
+                    base_env = base_env.env
+                    
+                if hasattr(base_env, 'cfg'):
+                    base_env.cfg.transaction_cost_bps = stage.transaction_cost_bps
+                    base_env.cfg.delist_extra_bps = stage.delist_extra_bps
+                    base_env.cfg.lambda_turnover = stage.lambda_turnover
+                    base_env.cfg.lambda_hhi = stage.lambda_hhi
+                    base_env.cfg.lambda_drawdown = stage.lambda_drawdown
+        
+        # Update PPO hyperparameters
+        # For learning rate and clip_range, we need to handle them as schedules
+        from stable_baselines3.common.utils import constant_fn
+        
+        # Update learning rate (needs to be a schedule)
+        self.model.learning_rate = constant_fn(stage.learning_rate)
+        
+        # Update entropy coefficient
+        self.model.ent_coef = stage.ent_coef
+        
+        # Update clip range (needs to be a schedule)
+        self.model.clip_range = constant_fn(stage.clip_range)
+        
+        # Update max grad norm if it exists
+        if hasattr(self.model, 'max_grad_norm'):
+            self.model.max_grad_norm = stage.max_grad_norm
+
+# NEW: Market Regime Curriculum Callback
+class MarketRegimeCurriculumCallback(BaseCallback):
+    """Handles curriculum learning across market regimes"""
+    def __init__(self, regimes: List[MarketRegime], train_panel: pd.DataFrame, verbose: int = 1):
+        super().__init__(verbose)
+        self.regimes = regimes
+        self.train_panel = train_panel
+        self.current_regime = 0
+        self.regime_timesteps = 0
+        self._compute_market_indicators()
+        
+    def _compute_market_indicators(self):
+        """Pre-compute volatility and trend indicators for the training data"""
+        # Group by date and compute daily market returns
+        daily_returns = self.train_panel.groupby(level=0)['return'].mean()
+        
+        # Compute rolling volatility (20-day)
+        self.volatility = daily_returns.rolling(20).std()
+        self.volatility_percentiles = self.volatility.rank(pct=True)
+        
+        # Compute trend strength (60-day return)
+        self.trend_strength = daily_returns.rolling(60).mean()
+        self.trend_percentiles = self.trend_strength.rank(pct=True)
+        
+    def _filter_dates_for_regime(self, regime: MarketRegime) -> pd.DatetimeIndex:
+        """Filter dates that match the regime characteristics"""
+        vol_mask = (
+            (self.volatility_percentiles >= regime.volatility_percentile[0]) &
+            (self.volatility_percentiles <= regime.volatility_percentile[1])
+        )
+        trend_mask = (
+            (self.trend_percentiles >= regime.trend_strength[0]) &
+            (self.trend_percentiles <= regime.trend_strength[1])
+        )
+        return self.volatility_percentiles[vol_mask & trend_mask].index
+        
+    def _on_step(self) -> bool:
+        # Get number of environments from the model
+        n_envs = self.model.env.num_envs if hasattr(self.model.env, 'num_envs') else 1
+        self.regime_timesteps += n_envs
+        
+        # Check if we should move to next regime
+        if self.current_regime < len(self.regimes) - 1:
+            if self.regime_timesteps >= self.regimes[self.current_regime].timesteps:
+                self._advance_regime()
+        
+        return True
+    
+    def _advance_regime(self):
+        self.current_regime += 1
+        self.regime_timesteps = 0
+        regime = self.regimes[self.current_regime]
+        
+        if self.verbose > 0:
+            print(f"\n{'='*60}")
+            print(f"CURRICULUM LEARNING: Switching to {regime.name}")
+            print(f"  Volatility range: {regime.volatility_percentile[0]*100:.0f}th-{regime.volatility_percentile[1]*100:.0f}th percentile")
+            print(f"  Trend strength: {regime.trend_strength[0]*100:.0f}th-{regime.trend_strength[1]*100:.0f}th percentile")
+            print(f"{'='*60}\n")
+        
+        # Filter training dates for this regime
+        regime_dates = self._filter_dates_for_regime(regime)
+        
+        # Update environment reset behavior to sample from these dates
+        vec_env = self.model.env
+        if hasattr(vec_env, 'venv'):
+            actual_vec_env = vec_env.venv
+        else:
+            actual_vec_env = vec_env
+            
+        if hasattr(actual_vec_env, 'envs'):
+            for env in actual_vec_env.envs:
+                base_env = env
+                while hasattr(base_env, 'env'):
+                    base_env = base_env.env
+                    
+                if hasattr(base_env, 'set_sampling_dates'):
+                    base_env.set_sampling_dates(regime_dates)
+
 # ------------------------ In-Sample Validation ------------------ #
 
 def validate_reward_params(
@@ -588,10 +706,13 @@ def validate_reward_params(
     ppo_cfg: PPOConfig,
     lambda_grid: Dict[str, List[float]],
     selection_metric: str = "ir",
-    seed: int = 0,
     validation_timesteps: int = 1000,
+    seed: int = 0,
 ) -> Dict[str, float]:
     """Fast grid-search for lambda penalties."""
+    print("\n[HYPERPARAMETER VALIDATION]")
+    print(f"  Selection metric: {selection_metric}")
+    
     import dataclasses
     from dataclasses import asdict
     
@@ -622,7 +743,6 @@ def validate_reward_params(
         from itertools import product
         combinations = list(product(grid_to, grid_hhi, grid_dd))
         
-        print(f"\n[HYPERPARAMETER VALIDATION]")
         print(f"  Testing {len(combinations)} combinations...")
         
         best_score = -np.inf
@@ -683,32 +803,36 @@ def validate_reward_params(
                 if dones[0]:
                     break
             
-            # Score
-            if returns and selection_metric == "ir":
-                score = compute_information_ratio_jit(
-                    np.array(returns, dtype=np.float32),
-                    np.zeros(len(returns), dtype=np.float32),  # Simplified
-                    252
-                )
-            else:
-                score = np.mean(returns) if returns else -np.inf
-            
-            if score > best_score:
-                best_score = score
-                best = (float(lam_to), float(lam_hhi), float(lam_dd))
-            
-            if i % max(1, len(combinations) // 3) == 1:
-                print(f"    Tested {i}/{len(combinations)}, best score: {best_score:.4f}")
+            # Compute metric
+            if len(returns) > 1:
+                ret_arr = np.array(returns)
+                if selection_metric == "sharpe":
+                    score = compute_sharpe_ratio_jit(ret_arr, np.zeros_like(ret_arr))
+                elif selection_metric == "ir":
+                    bench = np.zeros_like(ret_arr)  # Could use actual benchmark
+                    score = compute_information_ratio_jit(ret_arr, bench)
+                else:
+                    score = ret_arr.mean()
+                
+                if score > best_score:
+                    best_score = score
+                    best = (lam_to, lam_hhi, lam_dd)
+                
+                print(f"    [{i}/{len(combinations)}] λ_to={lam_to:.4f}, λ_hhi={lam_hhi:.4f}, λ_dd={lam_dd:.4f} → {selection_metric}={score:.3f}")
             
             venv.close()
             venv_val.close()
-            del model
+            del model, venv, venv_val
             gc.collect()
     
-    print(f"  Best lambdas: turnover={best[0]:.4f}, hhi={best[1]:.4f}, dd={best[2]:.4f}")
-    return {"lambda_turnover": best[0], "lambda_hhi": best[1], "lambda_drawdown": best[2]}
+    print(f"  Best: λ_to={best[0]:.4f}, λ_hhi={best[1]:.4f}, λ_dd={best[2]:.4f} (score={best_score:.3f})")
+    return {
+        "lambda_turnover": float(best[0]),
+        "lambda_hhi": float(best[1]),
+        "lambda_drawdown": float(best[2]),
+    }
 
-# ------------------------------ Train One ----------------------- #
+# ---------------------------- Main Training Function ----------------------- #
 
 def train_one(
     universe: str,
@@ -718,18 +842,24 @@ def train_one(
     ppo_cfg: PPOConfig,
     env_cfg: EnvConfig,
     out_base: str,
-    lambda_grid: Optional[Dict[str, List[float]]] = None,
-    save_freq: int = 500_000,
-    selection_metric: str = "ir",
-    resume: bool = False,
-    n_envs: int = 16,
-    vec_kind: str = "dummy",
-    episode_len: Optional[int] = 256,
-    reset_jitter_frac: float = 0.9,
-    validation_timesteps: int = 1000,
-    do_validation: bool = False,
+    lambda_grid: Optional[Dict[str, List[float]]],
+    save_freq: int,
+    selection_metric: str,
+    resume: bool,
+    n_envs: int,
+    vec_kind: str,
+    episode_len: Optional[int],
+    reset_jitter_frac: Optional[float],
+    validation_timesteps: int,
+    do_validation: bool,
+    use_progressive: bool = False,  # NEW
+    progressive_stages: Optional[List[ProgressiveStage]] = None,  # NEW
+    use_curriculum: bool = False,  # NEW
+    market_regimes: Optional[List[MarketRegime]] = None,  # NEW
 ) -> Dict[str, str]:
-    """Train a single fold/seed combination with top-K panel."""
+    """
+    Train a single fold/seed combination with optional progressive training and curriculum learning.
+    """
     fold_i = int(fold_cfg["fold"])
     seed = int(seed)
     
@@ -740,6 +870,10 @@ def train_one(
     print(f"Train: {fold_cfg['train_start']} to {fold_cfg['train_end']}")
     print(f"Test: {fold_cfg['test_start']} to {fold_cfg['test_end']}")
     print(f"Max assets: {env_cfg.max_assets}")
+    if use_progressive:
+        print(f"Progressive training: {len(progressive_stages)} stages")
+    if use_curriculum:
+        print(f"Curriculum learning: {len(market_regimes)} market regimes")
     
     # Setup directories
     results_dir = os.path.join(out_base, "results", universe)
@@ -776,6 +910,19 @@ def train_one(
                 validation_timesteps, seed
             )
             env_cfg = EnvConfig(**{**asdict(env_cfg), **best})
+        
+        # If using progressive training, start with stage 0 parameters
+        if use_progressive and progressive_stages:
+            stage_0 = progressive_stages[0]
+            env_cfg.transaction_cost_bps = stage_0.transaction_cost_bps
+            env_cfg.delist_extra_bps = stage_0.delist_extra_bps
+            env_cfg.lambda_turnover = stage_0.lambda_turnover
+            env_cfg.lambda_hhi = stage_0.lambda_hhi
+            env_cfg.lambda_drawdown = stage_0.lambda_drawdown
+            ppo_cfg.learning_rate = stage_0.learning_rate
+            ppo_cfg.ent_coef = stage_0.ent_coef
+            ppo_cfg.clip_range = stage_0.clip_range
+            ppo_cfg.max_grad_norm = stage_0.max_grad_norm
         
         # Create environments
         print(f"\n[ENVIRONMENT SETUP]")
@@ -892,6 +1039,14 @@ def train_one(
                 )
             ]
             
+            # Add progressive training callback if enabled
+            if use_progressive and progressive_stages:
+                callbacks.append(ProgressiveTrainingCallback(progressive_stages))
+            
+            # Add curriculum learning callback if enabled
+            if use_curriculum and market_regimes:
+                callbacks.append(MarketRegimeCurriculumCallback(market_regimes, train_panel))
+            
             model.learn(total_timesteps=remaining, 
                        callback=CallbackList(callbacks),
                        progress_bar=True)
@@ -979,6 +1134,79 @@ def _load_panel_for_universe(universe: str, data_dir: str) -> pd.DataFrame:
     
     return df
 
+def get_default_progressive_stages() -> List[ProgressiveStage]:
+    """Get default progressive training stages"""
+    return [
+        ProgressiveStage(
+            name="Stage 1: No Costs",
+            timesteps=10000,
+            transaction_cost_bps=0.0,
+            delist_extra_bps=0.0,
+            lambda_turnover=0.0,
+            lambda_hhi=0.005,
+            lambda_drawdown=0.0,
+            learning_rate=1e-4,
+            ent_coef=0.02,
+            clip_range=0.3,
+            max_grad_norm=1.0,
+        ),
+        ProgressiveStage(
+            name="Stage 2: Low Costs",
+            timesteps=10000,
+            transaction_cost_bps=5.0,
+            delist_extra_bps=5.0,
+            lambda_turnover=0.01,
+            lambda_hhi=0.01,
+            lambda_drawdown=0.002,
+            learning_rate=5e-5,
+            ent_coef=0.01,
+            clip_range=0.2,
+            max_grad_norm=0.7,
+        ),
+        ProgressiveStage(
+            name="Stage 3: Full Costs",
+            timesteps=20000,
+            transaction_cost_bps=10.0,
+            delist_extra_bps=10.0,
+            lambda_turnover=0.02,
+            lambda_hhi=0.01,
+            lambda_drawdown=0.005,
+            learning_rate=5e-6,
+            ent_coef=0.005,
+            clip_range=0.1,
+            max_grad_norm=0.3,
+        ),
+    ]
+
+def get_default_market_regimes() -> List[MarketRegime]:
+    """Get default market regime curriculum"""
+    return [
+        MarketRegime(
+            name="Stable Market",
+            volatility_percentile=(0.0, 0.33),
+            trend_strength=(0.33, 0.67),
+            timesteps=10000,
+        ),
+        MarketRegime(
+            name="Trending Market",
+            volatility_percentile=(0.0, 0.5),
+            trend_strength=(0.67, 1.0),
+            timesteps=10000,
+        ),
+        MarketRegime(
+            name="Volatile Market",
+            volatility_percentile=(0.67, 1.0),
+            trend_strength=(0.0, 1.0),
+            timesteps=10000,
+        ),
+        MarketRegime(
+            name="Mixed Conditions",
+            volatility_percentile=(0.0, 1.0),
+            trend_strength=(0.0, 1.0),
+            timesteps=10000,
+        ),
+    ]
+
 def main():
     parser = argparse.ArgumentParser(description="Train MaskablePPO with memory-efficient top-K constraint")
     parser.add_argument("--universe", type=str, choices=["cdi", "infra"], required=True)
@@ -987,18 +1215,26 @@ def main():
     parser.add_argument("--config", type=str, default="config.yaml")
     parser.add_argument("--n_folds", type=int, default=9)
     parser.add_argument("--embargo_days", type=int, default=3)
-    parser.add_argument("--seeds", type=str, default="0,1,2,4")
+    parser.add_argument("--seeds", type=str, default="0,1,2")
     parser.add_argument("--selection_metric", default="ir", choices=["ir","sharpe","sortino","calmar"])
     parser.add_argument("--skip_finished", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--n_envs", type=int, default=16)
-    parser.add_argument("--vec", type=str, default="dummy", choices=["dummy","subproc"])
+    parser.add_argument("--vec", type=str, default="subproc", choices=["dummy","subproc"])
     parser.add_argument("--n_jobs", type=int, default=1)
+    
+    # NEW: Progressive training and curriculum learning arguments
+    parser.add_argument("--progressive", action="store_true", help="Enable progressive training")
+    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning")
     
     args = parser.parse_args()
     
     print("\n" + "="*60)
     print("MEMORY-EFFICIENT PPO TRAINING WITH TOP-K CONSTRAINT")
+    if args.progressive:
+        print("WITH PROGRESSIVE TRAINING")
+    if args.curriculum:
+        print("WITH CURRICULUM LEARNING")
     print("="*60)
     print(f"Universe: {args.universe.upper()}")
     print(f"Configuration: {args.config}")
@@ -1051,21 +1287,21 @@ def main():
     )
     
     env_cfg = EnvConfig(
-        rebalance_interval=config.get('rebalance_interval', 5),
+        rebalance_interval=config.get('rebalance_interval', 21),
         max_weight=config.get('max_weight', 0.10),
-        weight_blocks=config.get('weight_blocks', 100),
+        weight_blocks=config.get('weight_blocks', 50),
         max_assets=config.get('max_assets', 50),
         allow_cash=config.get('allow_cash', True),
         cash_rate_as_rf=config.get('cash_rate_as_rf', True),
         on_inactive=config.get('on_inactive', 'to_cash'),
-        transaction_cost_bps=config.get('transaction_cost_bps', 20.0),
-        delist_extra_bps=config.get('delist_extra_bps', 20.0),
+        transaction_cost_bps=config.get('transaction_cost_bps', 10.0),
+        delist_extra_bps=config.get('delist_extra_bps', 10.0),
         normalize_features=config.get('normalize_features', True),
         obs_clip=config.get('obs_clip', 7.5),
         include_prev_weights=config.get('include_prev_weights', False),
         include_active_flag=config.get('include_active_flag', False),
         global_stats=config.get('global_stats', True),
-        lambda_turnover=config.get('lambda_turnover', 0.0002),
+        lambda_turnover=config.get('lambda_turnover', 0.05),
         lambda_hhi=config.get('lambda_hhi', 0.01),
         lambda_drawdown=config.get('lambda_drawdown', 0.005),
         lambda_tail=config.get('lambda_tail', 0.001),
@@ -1093,17 +1329,30 @@ def main():
     lambda_grid = config.get('lambda_grid', None) if do_validation else None
     validation_timesteps = config.get('validation_timesteps', 1000)
     
+    # NEW: Get progressive and curriculum configs
+    progressive_stages = get_default_progressive_stages() if args.progressive else None
+    market_regimes = get_default_market_regimes() if args.curriculum else None
+    
     # Save config
     config_path = os.path.join(results_dir, "training_config.json")
     with open(config_path, "w") as f:
-        json.dump({
+        training_config = {
             "ppo_config": asdict(ppo_cfg),
             "env_config": asdict(env_cfg),
             "lambda_grid": lambda_grid,
             "seeds": args.seeds,
             "n_folds": args.n_folds,
             "max_assets": env_cfg.max_assets,
-        }, f, indent=2)
+            "use_progressive": args.progressive,
+            "use_curriculum": args.curriculum,
+        }
+        
+        if progressive_stages:
+            training_config["progressive_stages"] = [asdict(s) for s in progressive_stages]
+        if market_regimes:
+            training_config["market_regimes"] = [asdict(r) for r in market_regimes]
+            
+        json.dump(training_config, f, indent=2)
     
     # Train
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
@@ -1134,11 +1383,15 @@ def main():
                 args.selection_metric,
                 args.resume,
                 args.n_envs if args.n_envs else config.get('n_envs', 16),
-                args.vec if args.vec else config.get('vec', 'dummy'),
+                args.vec if args.vec else config.get('vec', 'subproc'),
                 config.get('episode_len', 256),
                 config.get('reset_jitter_frac', 0.9),
                 validation_timesteps,
                 do_validation,
+                use_progressive=args.progressive,
+                progressive_stages=progressive_stages,
+                use_curriculum=args.curriculum,
+                market_regimes=market_regimes,
             )
     
     print("\n" + "="*60)
