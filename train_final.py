@@ -386,7 +386,12 @@ def build_topk_panel(panel: pd.DataFrame,
 
 def _policy_kwargs_from_cfg(ppo_cfg: PPOConfig) -> dict:
     act_fn = nn.Tanh if str(ppo_cfg.activation).lower() == "tanh" else nn.ReLU
-    return dict(net_arch=ppo_cfg.net_arch, activation_fn=act_fn, ortho_init=ppo_cfg.ortho_init)
+    return dict(
+        net_arch=ppo_cfg.net_arch,
+        activation_fn=act_fn,
+        ortho_init=ppo_cfg.ortho_init,
+        # features_extractor_kwargs=dict(dropout_rate=0.2)
+    )
 
 def set_global_seed(seed: int = 0):
     """Set all random seeds for reproducibility."""
@@ -496,12 +501,44 @@ class DetailedMetricsLoggerCallback(BaseCallback):
             if mem_gb:
                 print(f"  Memory usage: {mem_gb:.2f} GB")
 
+    # train_final.py - Replace the _on_step method in DetailedMetricsLoggerCallback
+
     def _on_step(self) -> bool:
-        if self.locals.get("dones", [False])[0]:
-            self.episode_count += 1
-            info = self.locals.get("infos", [{}])[0]
-            ep_reward = info.get("episode", {}).get("r", 0)
-            self.recent_rewards.append(ep_reward)
+        # Handle vectorized environments properly
+        dones = self.locals.get("dones", [False])
+        infos = self.locals.get("infos", [{}])
+        
+        # Check each environment
+        for i, (done, info) in enumerate(zip(dones, infos)):
+            if done:
+                self.episode_count += 1
+                
+                # Try to get episode reward from multiple possible sources
+                ep_reward = None
+                
+                # Method 1: From episode key
+                if "episode" in info:
+                    ep_reward = info["episode"].get("r", None)
+                
+                # Method 2: From episode reward key (some envs use this)
+                if ep_reward is None and "episode_reward" in info:
+                    ep_reward = info["episode_reward"]
+                
+                # Method 3: From terminal observation (for vec envs)
+                if ep_reward is None and "terminal_observation" in info:
+                    # This means the env was reset, look for episode info
+                    if "episode" in info:
+                        ep_reward = info["episode"].get("r", None)
+                
+                # Only append if we got a valid reward
+                if ep_reward is not None and np.isfinite(ep_reward):
+                    self.recent_rewards.append(float(ep_reward))
+                    
+                    # # Print progress every 10 episodes
+                    # if self.episode_count % 10 == 0 and self.verbose > 0:
+                    #     recent_mean = np.mean(list(self.recent_rewards)[-10:]) if self.recent_rewards else 0
+                    #     print(f"  Episode {self.episode_count}: Recent mean reward = {recent_mean:.4f}")
+        
         return True
 
     def _on_training_end(self) -> None:
@@ -961,8 +998,14 @@ def train_one(
         else:
             vec_env = SubprocVecEnv(thunks, start_method="spawn")
         
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True,
-                              clip_obs=10.0, clip_reward=10.0, gamma=ppo_cfg.gamma)
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            clip_reward=10.0,
+            gamma=ppo_cfg.gamma,
+        )
         
         # Create or load model
         set_global_seed(seed)
@@ -1143,8 +1186,8 @@ def get_default_progressive_stages() -> List[ProgressiveStage]:
             transaction_cost_bps=0.0,
             delist_extra_bps=0.0,
             lambda_turnover=0.0,
-            lambda_hhi=0.005,
-            lambda_drawdown=0.0,
+            lambda_hhi=0.001,
+            lambda_drawdown=0.01,
             learning_rate=1e-4,
             ent_coef=0.02,
             clip_range=0.3,
@@ -1155,9 +1198,9 @@ def get_default_progressive_stages() -> List[ProgressiveStage]:
             timesteps=10000,
             transaction_cost_bps=5.0,
             delist_extra_bps=5.0,
-            lambda_turnover=0.01,
-            lambda_hhi=0.01,
-            lambda_drawdown=0.002,
+            lambda_turnover=0.05,
+            lambda_hhi=0.001,
+            lambda_drawdown=0.01,
             learning_rate=5e-5,
             ent_coef=0.01,
             clip_range=0.2,
@@ -1168,10 +1211,10 @@ def get_default_progressive_stages() -> List[ProgressiveStage]:
             timesteps=20000,
             transaction_cost_bps=10.0,
             delist_extra_bps=10.0,
-            lambda_turnover=0.02,
-            lambda_hhi=0.01,
-            lambda_drawdown=0.005,
-            learning_rate=5e-6,
+            lambda_turnover=0.1,
+            lambda_hhi=0.001,
+            lambda_drawdown=0.01,
+            learning_rate=1e-6,
             ent_coef=0.005,
             clip_range=0.1,
             max_grad_norm=0.3,

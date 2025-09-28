@@ -1009,6 +1009,17 @@ class DebentureTradingEnv(gym.Env):
                 if k not in self._history:
                     self._history[k] = []
                 self._history[k].append(v)
+        
+        if "rewards" not in self._history:
+            self._history["rewards"] = []
+        self._history["rewards"].append(reward)
+
+        # Add episode statistics when episode ends
+        if terminated or truncated:
+            info["episode"] = {
+                "r": sum(self._history.get("rewards", [])),  # Total episode reward
+                "l": len(self._history.get("rewards", [])),  # Episode length
+            }
                 
         return obs, reward, terminated, truncated, info
 

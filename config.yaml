@@ -4,11 +4,11 @@
 
 # PPO Hyperparameters
 policy: MultiInputPolicy
-total_timesteps: 81920  # Increased to be meaningful (multiple of n_steps)
-learning_rate: 5.0e-5
-n_steps: 256       
-batch_size: 124
-n_epochs: 10
+total_timesteps: 80640  # Increased to be meaningful (multiple of n_steps)
+learning_rate: 1.0e-5
+n_steps: 504       
+batch_size: 252
+n_epochs: 6
 gamma: 0.99
 gae_lambda: 0.95
 clip_range: 0.2
@@ -17,7 +17,7 @@ ent_coef: 0.01
 vf_coef: 0.5
 max_grad_norm: 0.3
 target_kl: 0.1
-net_arch: [256, 256]
+net_arch: [512, 256, 128]
 ortho_init: true
 activation: tanh
 
@@ -40,8 +40,8 @@ delist_extra_bps: 10.0  # Extra slippage on forced liquidation
 # Observation processing
 normalize_features: true
 obs_clip: 7.5
-include_prev_weights: false
-include_active_flag: false
+include_prev_weights: true
+include_active_flag: true
 global_stats: true
 use_momentum_features: true
 use_volatility_features: true
@@ -60,7 +60,7 @@ weight_alpha: 1.0   # Weight for alpha (r - index)
 
 # Reward penalties
 lambda_turnover: 0.1
-lambda_hhi: 0.01
+lambda_hhi: 0.001
 lambda_drawdown: 0.01
 lambda_tail: 0.01  # Set to 0 to disable tail risk penalty
 
@@ -70,7 +70,7 @@ tail_q: 0.05
 dd_mode: incremental  # or "level"
 
 # Episode control
-max_steps: 256  # Episode length matches steps per env per rollout
+max_steps: 252  # Episode length matches steps per env per rollout
 random_reset_frac: 0.9  # For training data augmentation
 max_assets: 50  # Use only top 50 assets by weight each day
 
