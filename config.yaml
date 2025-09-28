@@ -5,18 +5,18 @@
 # PPO Hyperparameters
 policy: MultiInputPolicy
 total_timesteps: 40960  # Increased to be meaningful (multiple of n_steps)
-learning_rate: 5.0e-6
+learning_rate: 5.0e-5
 n_steps: 256       
 batch_size: 124
 n_epochs: 10
 gamma: 0.99
 gae_lambda: 0.95
-clip_range: 0.075
-clip_range_vf: 0.075
-ent_coef: 0.0003
+clip_range: 0.2
+clip_range_vf: 0.2
+ent_coef: 0.01
 vf_coef: 0.5
 max_grad_norm: 0.3
-target_kl: 0.125
+target_kl: 0.1
 net_arch: [256, 256]
 ortho_init: true
 activation: tanh
@@ -26,7 +26,7 @@ activation: tanh
 # ========================
 
 # Portfolio constraints
-rebalance_interval: 10
+rebalance_interval: 21 # Monthly rebalancing
 max_weight: 0.10
 weight_blocks: 50  # For discrete action space (2% granularity)
 allow_cash: true
@@ -59,10 +59,10 @@ use_rolling_zscores: false
 weight_alpha: 1.0   # Weight for alpha (r - index)
 
 # Reward penalties
-lambda_turnover: 0.01
+lambda_turnover: 0.05
 lambda_hhi: 0.01
-lambda_drawdown: 0.005
-lambda_tail: 0.001  # Set to 0 to disable tail risk penalty
+lambda_drawdown: 0.01
+lambda_tail: 0.01  # Set to 0 to disable tail risk penalty
 
 # Tail risk configuration (only used if lambda_tail > 0)
 tail_window: 60
@@ -110,7 +110,7 @@ skip_finished: true
 resume_from_checkpoint: true
 episode_len: 256  # Set to match max_steps for consistency
 reset_jitter_frac: 0.9  # Randomize starting point in training data
-vec: subproc  # Use subprocess vectorization for parallel envs
+vec: dummy  # Use subprocess vectorization for parallel envs
 
 # ========================
 # Evaluation Configuration

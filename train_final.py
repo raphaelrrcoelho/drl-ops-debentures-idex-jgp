@@ -723,7 +723,7 @@ def train_one(
     selection_metric: str = "ir",
     resume: bool = False,
     n_envs: int = 16,
-    vec_kind: str = "subproc",
+    vec_kind: str = "dummy",
     episode_len: Optional[int] = 256,
     reset_jitter_frac: float = 0.9,
     validation_timesteps: int = 1000,
@@ -992,7 +992,7 @@ def main():
     parser.add_argument("--skip_finished", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--n_envs", type=int, default=16)
-    parser.add_argument("--vec", type=str, default="subproc", choices=["dummy","subproc"])
+    parser.add_argument("--vec", type=str, default="dummy", choices=["dummy","subproc"])
     parser.add_argument("--n_jobs", type=int, default=1)
     
     args = parser.parse_args()
@@ -1134,7 +1134,7 @@ def main():
                 args.selection_metric,
                 args.resume,
                 args.n_envs if args.n_envs else config.get('n_envs', 16),
-                args.vec if args.vec else config.get('vec', 'subproc'),
+                args.vec if args.vec else config.get('vec', 'dummy'),
                 config.get('episode_len', 256),
                 config.get('reset_jitter_frac', 0.9),
                 validation_timesteps,
