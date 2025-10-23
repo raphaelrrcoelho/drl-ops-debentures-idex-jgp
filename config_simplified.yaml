@@ -1,0 +1,220 @@
+# config_simplified.yaml
+# ========================
+# SIMPLIFIED CONFIGURATION FOR EFFICIENT TRAINING
+# ========================
+# This configuration implements all critical fixes for computational feasibility:
+# 1. Dramatically reduced feature set (120 â†’ ~15 features per asset)
+# 2. Increased training budget (80K â†’ 1M timesteps)
+# 3. Smaller network architecture ([512,256,128] â†’ [128,64])
+# 4. Higher learning rate (1e-5 â†’ 3e-4)
+# 5. Simplified reward function (5 penalties â†’ 1)
+# 6. Fixed hyperparameters (n_steps, batch_size properly configured)
+
+# ========================
+# DATA STRUCTURE (CRITICAL - READ FIRST)
+# ========================
+# Returns in this dataset are EXCESS returns over CDI:
+#   Bond Return = Carry (spread) + MtM
+#   These are NOT total returns
+#
+# Example: If CDI = 5 bps and bond earns 100 bps spread:
+#   Bond return in data = 100 bps (excess over CDI)
+#
+# RETURN DEFINITIONS:
+# - r_p = portfolio excess return (weighted avg of bond returns)
+# - r_p_total = r_p + rf = total portfolio return (for wealth)
+# - alpha = r_p - r_index = active return vs benchmark
+# - r_net = (1 + r_p) * (1 - costs) - 1 = net return after costs
+#
+# METRICS:
+# - Sharpe: mean(r_p) / std(r_p) * sqrt(252) [Sharpe of excess returns]
+# - Information Ratio: mean(alpha) / std(alpha) * sqrt(252)
+# - Wealth: cumulative product of (1 + r_net_total) [uses total returns]
+#
+# REWARD:
+# reward = alpha - transaction_costs - penalties
+# where alpha = r_p - r_index (both excess returns)
+
+# ========================
+# PPO Hyperparameters (OPTIMIZED)
+# ========================
+policy: MultiInputPolicy
+total_timesteps: 1000000  # Was 80,640 â†’ 12x increase (62 updates instead of 10)
+learning_rate: 3.0e-4     # Was 1e-5 â†’ Standard PPO learning rate
+n_steps: 2048            # Was 504 â†’ Better for monthly rebalancing (21 days)
+batch_size: 512          # Was 252 â†’ Properly divides n_steps Ã— n_envs
+n_epochs: 10             # Was 6 â†’ More epochs per update
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.2
+clip_range_vf: 0.2
+ent_coef: 0.01           # Encourage exploration
+vf_coef: 0.5
+max_grad_norm: 0.5       # Was 0.3 â†’ Slightly more flexible
+target_kl: 0.01          # Was 0.1 â†’ Tighter constraint
+net_arch: [128, 64]      # Was [512, 256, 128] â†’ 5x fewer parameters
+ortho_init: true
+activation: tanh
+
+# ========================
+# Environment Configuration
+# ========================
+
+# Portfolio constraints
+rebalance_interval: 21   # Monthly rebalancing
+max_weight: 0.10         # 10% max per asset
+weight_blocks: 50        # For discrete action space (2% granularity)
+allow_cash: true
+cash_rate_as_rf: true
+on_inactive: to_cash     # Liquidate inactive assets to cash
+
+# Transaction costs
+transaction_cost_bps: 10.0   # 10 bps per unit of turnover
+delist_extra_bps: 10.0       # Extra cost for forced liquidations
+
+# Observation processing
+normalize_features: true
+obs_clip: 5.0
+include_prev_weights: true
+include_active_flag: true
+global_stats: true
+
+# ========================
+# FEATURE SELECTION (SIMPLIFIED)
+# ========================
+# CRITICAL: Disable expensive/redundant features
+# Expected: ~15 features per asset instead of 120+
+# Observation space: 50 Ã— 15 = 750 dims (vs 6,300)
+
+use_momentum_features: true        # Keep (1 window: 20d)
+use_volatility_features: true      # Keep (1 window: 20d)
+use_relative_value_features: true  # Keep (spread vs sector)
+use_duration_features: true        # Keep (modified duration)
+use_microstructure_features: true  # Keep (liquidity, weight momentum)
+use_carry_features: true           # Keep (carry/spread ratio)
+use_spread_dynamics: true          # Keep (momentum, mean reversion)
+
+# DISABLE EXPENSIVE/REDUNDANT FEATURES
+use_risk_adjusted_features: false  # Disable (Sharpe ratios are redundant)
+use_sector_curves: false           # Disable (Nelson-Siegel is expensive)
+use_zscore_features: false         # Disable (redundant with normalization)
+use_rolling_zscores: false         # Disable (double redundant)
+
+# ========================
+# Reward Configuration (SIMPLIFIED)
+# ========================
+weight_alpha: 1.0   # Weight for alpha (r - index)
+
+# SIMPLIFIED PENALTIES: Focus on one objective
+lambda_turnover: 0.01    # Was 0.1 â†’ Lighter penalty, let agent learn first
+lambda_hhi: 0.0          # Was 0.001 â†’ DISABLED for simplicity
+lambda_drawdown: 0.0     # Was 0.01 â†’ DISABLED for simplicity
+lambda_tail: 0.0         # Was 0.01 â†’ DISABLED for simplicity
+
+# Tail risk configuration (disabled)
+tail_window: 60
+tail_q: 0.05
+dd_mode: incremental
+
+# Episode control
+max_steps: 252              # Episode length
+random_reset_frac: 0.9      # Data augmentation during training
+max_assets: 50              # Top 50 assets by weight
+
+# ========================
+# Validation Configuration
+# ========================
+do_validation: false        # Skip validation for faster training
+validation_timesteps: 1000
+validation_split: 0.8
+selection_metric: ir
+lambda_grid: null
+
+# ========================
+# Training Structure
+# ========================
+
+# Walk-forward configuration
+n_folds: 9
+embargo_days: 3
+seeds: "0,1,2"  # Test with 3 seeds for statistical validity
+
+# Checkpoint and logging
+checkpoint_freq: 100000     # Save every 100K steps
+tensorboard_log: true
+verbose: 1                  # Show progress
+
+# Parallel training (OPTIMIZED FOR MEMORY)
+n_envs: 8                   # Was 16 â†’ Reduced for memory with larger obs space
+n_jobs: 1                   # Sequential fold/seed training
+
+# Training options
+skip_finished: true
+resume_from_checkpoint: true
+episode_len: 252
+reset_jitter_frac: 0.9
+vec: dummy
+
+# ========================
+# Evaluation Configuration
+# ========================
+
+evaluation:
+  deterministic: true
+  save_weights: true
+  save_topk: true
+  topk_k: 10
+
+# ========================
+# Baseline Configuration
+# ========================
+
+baselines:
+  strategies: "EW,INDEX,RP_VOL,RP_DURATION,CARRY_TILT,MINVAR"
+  roll_window: 60
+  ridge: 1.0e-4
+
+# ========================
+# Analysis Configuration
+# ========================
+
+analysis:
+  # Bootstrap confidence intervals
+  n_bootstrap: 2000
+  block_size: 21
+  
+  # Sensitivity analysis
+  run_sensitivity: false      # Disable for faster initial results
+  sensitivity_params: "lambda_turnover,transaction_cost_bps"
+  sensitivity_values: "0.5,1.0,2.0"
+  
+  # Statistical tests
+  dm_pairs: "PPO:EW,PPO:INDEX,PPO:MINVAR"
+  var_alpha: 0.95
+  nw_lag: null
+
+# ========================
+# EXPECTED PERFORMANCE
+# ========================
+# With these settings, expect:
+# - Training time: 4-6 hours per fold (vs 80+ hours before)
+# - Memory usage: ~8-12 GB GPU (vs OOM before)
+# - PPO Sharpe: 0.8-1.3 (realistic, not 2.5+ which indicates leakage)
+# - Turnover: 25-40% per month (not <10% which indicates look-ahead)
+# - Competitive with baselines (within 0.1-0.3 Sharpe)
+#
+# DISSERTATION CONTRIBUTION:
+# Even with "modest" Sharpe of 1.1 vs 0.85 for EW baseline:
+# - 30% improvement in risk-adjusted returns
+# - ~130 bps/year alpha after costs
+# - Strong academic contribution
+# - Demonstrates ML viability for active credit
+
+# ========================
+# CRITICAL REMINDERS
+# ========================
+# 1. All features, weights, and active flags are LAGGED by 1 day
+# 2. At time t, agent observes X_{t-1}, ACT_{t-1}, W_{t-1}
+# 3. Agent chooses w_t, which earns returns r_t
+# 4. No information leakage, no look-ahead bias
+# 5. Fair comparison with baselines
